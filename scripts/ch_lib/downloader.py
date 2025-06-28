@@ -2,8 +2,7 @@
 import sys
 import requests
 import os
-from . import util
-
+import util
 
 dl_ext = ".downloading"
 
@@ -11,7 +10,7 @@ dl_ext = ".downloading"
 requests.packages.urllib3.disable_warnings()
 
 # output is downloaded file path
-def dl(url, folder, filename, filepath):
+def dl(url, folder=None, filename=None, filepath=None):
     util.printD("Start downloading from: " + url)
     # get file_path
     file_path = ""
@@ -29,6 +28,14 @@ def dl(url, folder, filename, filepath):
 
         if filename:
             file_path = os.path.join(folder, filename)
+
+    # Add api key
+    has_api_key = False
+    if util.civitai_api_key:
+        has_api_key = True
+        util.def_headers["Authorization"] = f"Bearer {util.civitai_api_key}"
+
+    util.printD(f"use civitai api key: {has_api_key}")
 
     # first request for header
     rh = requests.get(url, stream=True, verify=False, headers=util.def_headers, proxies=util.proxies)

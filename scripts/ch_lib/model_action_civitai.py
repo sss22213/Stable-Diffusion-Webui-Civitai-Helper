@@ -2,10 +2,10 @@
 # handle msg between js and python side
 import os
 import time
-from . import util
-from . import model
-from . import civitai
-from . import downloader
+import util
+import model
+import civitai
+import downloader
 
 
 # scan model to generate SHA256, then use this SHA256 to get model info from civitai
@@ -204,7 +204,7 @@ def get_model_info_by_url(model_url_or_id:str) -> tuple:
     model_id = civitai.get_model_id_from_url(model_url_or_id)
     if not model_id:
         util.printD("failed to parse model id from url or id")
-        return    
+        return   
 
     model_info = civitai.get_model_info_by_id(model_id)
     if model_info is None:

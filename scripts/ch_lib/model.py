@@ -2,9 +2,7 @@
 # handle msg between js and python side
 import os
 import json
-from . import util
-from modules import shared
-
+import util
 
 # this is the default root path
 root_path = os.getcwd()
@@ -39,7 +37,7 @@ vae_suffix = ".vae"
 # get cusomter model path
 def get_custom_model_folder():
     util.printD("Get Custom Model Folder")
-
+'''
     global folders
 
     if shared.cmd_opts.embeddings_dir and os.path.isdir(shared.cmd_opts.embeddings_dir):
@@ -53,7 +51,7 @@ def get_custom_model_folder():
 
     if shared.cmd_opts.lora_dir and os.path.isdir(shared.cmd_opts.lora_dir):
         folders["lora"] = shared.cmd_opts.lora_dir
-
+'''
 
 
 

@@ -5,9 +5,8 @@ import time
 import json
 import re
 import requests
-from . import util
-from . import model
-from . import setting
+import util
+import model
 
 suffix = ".civitai"
 

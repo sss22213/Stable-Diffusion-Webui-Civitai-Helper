@@ -4,11 +4,11 @@ import os
 import json
 import requests
 import webbrowser
-from . import util
-from . import model
-from . import civitai
-from . import msg_handler
-from . import downloader
+import util
+import model
+import civitai
+import msg_handler
+import downloader
 
 
 

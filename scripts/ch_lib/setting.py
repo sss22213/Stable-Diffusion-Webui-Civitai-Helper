@@ -3,7 +3,7 @@
 import json
 import os
 import modules.scripts as scripts
-from . import util
+import util
 
 
 name = "setting.json"
