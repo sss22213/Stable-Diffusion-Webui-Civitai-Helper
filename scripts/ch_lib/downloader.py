@@ -1,125 +1,114 @@
-# -*- coding: UTF-8 -*-
-import sys
-import requests
 import os
-from . import util
+import shlex
+import subprocess
+import requests
 
+from scripts.ch_lib import util
 
-dl_ext = ".downloading"
-
-# disable ssl warning info
-requests.packages.urllib3.disable_warnings()
-
-# output is downloaded file path
 def dl(url, folder, filename, filepath):
-    util.printD("Start downloading from: " + url)
-    # get file_path
-    file_path = ""
+    util.printD("Start downloading (wget) from: " + url)
+
+    # ===== 決定目標路徑 =====
     if filepath:
         file_path = filepath
     else:
-        # if file_path is not in parameter, then folder must be in parameter
-        if not folder:
-            util.printD("folder is none")
-            return
-
-        if not os.path.isdir(folder):
-            util.printD("folder does not exist: "+folder)
-            return
+        if not folder or not os.path.isdir(folder):
+            util.printD("Invalid folder")
+            return None
 
         if filename:
             file_path = os.path.join(folder, filename)
+        else:
+            # 先用 requests 嘗試從 header 拿檔名（可有可無）
+            rh = requests.get(url, stream=True, verify=False, headers=util.def_headers, proxies=util.proxies)
+            cd = rh.headers.get("Content-Disposition", "")
+            if cd:
+                cd = cd.encode("latin1").decode("utf-8", errors="ignore")
+                try:
+                    filename = cd.split("filename=")[1].strip().strip('"')
+                    file_path = os.path.join(folder, filename)
+                except Exception:
+                    file_path = ""
+            else:
+                file_path = ""
 
-    # first request for header
-    rh = requests.get(url, stream=True, verify=False, headers=util.def_headers, proxies=util.proxies)
-    # get file size
-    total_size = int(rh.headers.get('Content-Length', -1))
-    if (total_size < 0):
-        util.printD('This model requires an API key to download. More info: https://github.com/butaixianran/Stable-Diffusion-Webui-Civitai-Helper#civitai-api-key')
-        return
-    util.printD(f"File size: {total_size}")
-
-    # if file_path is empty, need to get file name from download url's header
-    if not file_path:
-        filename = ""
-        if "Content-Disposition" in rh.headers.keys():
-            # headers default is decoded with latin1, so need to re-decode it with utf-8
-            cd = rh.headers["Content-Disposition"].encode('latin1').decode('utf-8', errors='ignore')
-            # Extract the filename from the header
-            # content of a CD: "attachment;filename=FileName.txt"
-            # in case "" is in CD filename's start and end, need to strip them out
-            filename = cd.split("=")[1].strip('"')
-            if not filename:
-                util.printD("Fail to get file name from Content-Disposition: " + cd)
-                return
-
-        if not filename:
-            util.printD("Can not get file name from download url's header")
-            return
-
-        # with folder and filename, now we have the full file path
-        file_path = os.path.join(folder, filename)
-
+            # 如果還是拿不到檔名，就先留空，稍後用 Location 的 query 解析也行
+            if not file_path:
+                util.printD("Can not get filename from header, will still download to folder with a temp name.")
+                file_path = os.path.join(folder, "civitai_model_download.bin")
 
     util.printD("Target file path: " + file_path)
-    base, ext = os.path.splitext(file_path)
 
-    # check if file is already exist
+    # 避免重名
+    base, ext = os.path.splitext(file_path)
     count = 2
-    new_base = base
-    while os.path.isfile(file_path):
-        util.printD("Target file already exist.")
-        # re-name
-        new_base = base + "_" + str(count)
-        file_path = new_base + ext
+    final_path = file_path
+    while os.path.exists(final_path):
+        final_path = f"{base}_{count}{ext}"
         count += 1
 
-    # use a temp file for downloading
-    dl_file_path = new_base+dl_ext
+    tmp_path = final_path + ".part"
+    util.printD("Downloading to temp file: " + tmp_path)
 
-
-    util.printD(f"Downloading to temp file: {dl_file_path}")
-
-    # check if downloading file is exsited
-    downloaded_size = 0
-    if os.path.exists(dl_file_path):
-        downloaded_size = os.path.getsize(dl_file_path)
-
-    util.printD(f"Downloaded size: {downloaded_size}")
-
-    # create header range
-    headers = {'Range': 'bytes=%d-' % downloaded_size}
-    headers['User-Agent'] = util.def_headers['User-Agent']
+    # ===== 第一步：向 civitai 取得 307 的 Location（必須帶 Bearer）=====
+    headers = dict(util.def_headers or {})
     if util.civitai_api_key:
         headers["Authorization"] = f"Bearer {util.civitai_api_key}"
 
-    # download with header
-    r = requests.get(url, stream=True, verify=False, headers=headers, proxies=util.proxies)
+    r = requests.get(
+        url,
+        allow_redirects=False,   # ★ 不跟轉址，自己拿 Location
+        verify=False,
+        headers=headers,
+        proxies=util.proxies
+    )
 
-    # write to file
-    with open(dl_file_path, "ab") as f:
-        for chunk in r.iter_content(chunk_size=1024):
-            if chunk:
-                downloaded_size += len(chunk)
-                f.write(chunk)
-                # force to write to disk
-                f.flush()
+    if r.status_code not in (301, 302, 303, 307, 308):
+        util.printD(f"Unexpected status: {r.status_code}")
+        util.printD(f"Body: {r.text[:300]}")
+        util.printD("This model may require API key or the endpoint changed.")
+        return None
 
-                # progress
-                progress = int(50 * downloaded_size / total_size)
-                sys.stdout.reconfigure(encoding='utf-8')
-                sys.stdout.write("\r[%s%s] %d%%" % ('-' * progress, ' ' * (50 - progress), 100 * downloaded_size / total_size))
-                sys.stdout.flush()
+    location = r.headers.get("Location")
+    if not location:
+        util.printD("No Location header found from civitai redirect response.")
+        return None
 
-    print()
+    util.printD("Redirect location obtained (download URL).")
 
-    # check file size
-    downloaded_size = os.path.getsize(dl_file_path)
-    if downloaded_size < total_size:
-        util.printD(f"Download failed due to insufficient file size. Try again later or download it manually: {url}")
-        return
+    # ===== 第二步：用 wget 下載 Location（★ 不帶 Authorization，避免 R2 400）=====
+    cmd = [
+        "wget",
+        "-c",
+        "--progress=bar:force",
+        "--no-check-certificate",
+        "-O", tmp_path,
+        location
+    ]
 
-    # rename file
-    os.rename(dl_file_path, file_path)
-    util.printD(f"File Downloaded to: {file_path}")
-    return file_path
+    # User-Agent
+    ua = (util.def_headers or {}).get("User-Agent")
+    if ua:
+        cmd.extend(["--user-agent", ua])
+
+    # Proxy：用環境變數給 wget
+    env = os.environ.copy()
+    if util.proxies:
+        if "http" in util.proxies:
+            env["http_proxy"] = util.proxies["http"]
+        if "https" in util.proxies:
+            env["https_proxy"] = util.proxies["https"]
+
+    util.printD("Running command:")
+    util.printD(" ".join(shlex.quote(c) for c in cmd))
+
+    proc = subprocess.run(cmd, env=env)
+
+    if proc.returncode != 0:
+        util.printD("wget download failed")
+        return None
+
+    # 下載完成：rename
+    os.rename(tmp_path, final_path)
+    util.printD(f"File Downloaded to: {final_path}")
+    return final_path
