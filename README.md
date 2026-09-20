@@ -19,6 +19,14 @@ or
 **Also, invokeAI 3.x and ComfyUI are wonderful choices for SD. Try them.**  
 
 
+# About this fork
+This fork (sss22213) keeps Civitai Helper 1.x working on **SD WebUI Forge (Classic / Neo)** with Gradio 4 and adds:
+
+* **Example images & card info** (tab section "Example Images & Card Info"): restore missing previews, save every civitai example image next to the model, and write trigger words + example prompts onto the Extra Networks cards. See [Example Images & Card Info](#example-images--card-info).
+* **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models and run scans. See [HTTP API](#http-api).
+* **Civitai Domain** setting for mirrors such as `civitai.red`.
+* Downloader fixes: wget based download with resume, relative redirect handling, clear message when a model needs an API key.
+
 # Civitai Helper
 Stable Diffusion Webui Extension for Civitai, to handle your models much more easily.  
 
@@ -35,11 +43,8 @@ Civitai: [Civitai Url](https://civitai.com/models/16768/civitai-helper-sd-webui-
   - 🌐: Open this model's Civitai url in a new tab
   - 💡: Add this model's trigger words to prompt
   - 🏷: Use this model's preview image's prompt
-* Example images & card info (this fork, section "Example Images & Card Info" in the tab):
-  - **Fetch Missing Previews**: re-download `.preview.png` for models that have none, trying every example image (no Civitai API call).
-  - **Write Example Prompt to Cards**: write trigger words + the first example prompt into the Extra Networks card (`<model>.json`: `description`, all example prompts into `notes`, and the Forge preset in `sd version` when unknown). Existing hand-written fields are kept unless "Overwrite" is checked.
-  - **Download Example Images**: save every example image next to the model as `<model>.example_NN.<ext>` (NN = position in the Civitai list, so the file maps back to its prompt in `.civitai.info`). Honors "Skip NSFW Preview Images".
-* HTTP API under `/civitai-helper/v1` (listed in the WebUI's `/docs`): model inventory (`/loras`, `/models`, `/models/{type}/info`, `/models/{type}/examples`), Civitai lookup (`/model-info`) and background tasks (`/scan`, `/download`, `/check-new-version`, `/fetch-previews`, `/download-examples`, `/write-card-info`, polled via `/tasks/{id}` or run with `"wait": true`). Task endpoints take either `model_types: [...]` or a single model as `type` + `name`.
+* Example images & card info (this fork, see below): fetch missing previews, write example prompts onto the cards, download all example images.
+* HTTP API (this fork, see below) for scripts and assistants.
 
 # Install
 Go to SD webui's extension tab, go to `Install from url` sub-tab.
@@ -130,6 +135,62 @@ After clicking button, extension will download that civitai model's info and pre
 
 ![](img/get_one_model_info.jpg)  
 
+## Example Images & Card Info
+Every model info file (`model_file.civitai.info`) already stores the example images of that version on civitai, usually with their full generation parameters (prompt, negative prompt, steps, sampler, CFG, seed, checkpoint). The original extension only used the first one as the card preview. The section "Example Images & Card Info" in the Civitai Helper tab makes the rest usable. Pick the model types first; every button below works on all models of those types. Run "Scan" first so the info files exist.
+
+### Fetch Missing Previews
+Downloads `model_file.preview.png` for every model that has none. It goes through the example images in order and takes the first one that can be downloaded, so a model whose first example image was deleted on civitai still gets a preview. No civitai API request is made, only image downloads, so it is fast and safe to run on the whole library. Models whose example images were all deleted on civitai are listed in the log; drop any picture next to them as `model_file.png` if you want a preview.
+
+### Write Example Prompt to Cards
+Writes into the WebUI's own card metadata file `model_file.json`:
+
+* `description`: trigger words, the first example prompt, its negative prompt and its parameters. The card shows the first 3 lines and expands when you hover over it (WebUI setting "Show description on cards" must be on, it is by default).
+* `notes`: every example prompt in full. Open the card's edit (pencil) dialog to read them.
+* `sd version`: the Forge preset (`sd`, `xl`, `flux`, ...) derived from the civitai base model, only when the card has none yet.
+
+By default only empty fields are filled, so descriptions and notes you wrote yourself are kept. Check "Overwrite existing description / notes" to replace them. The user fields `activation text`, `preferred weight` and `negative text` are never touched. Click "Refresh" in the Extra Networks tab afterwards to see the new descriptions.
+
+### Download Example Images
+Saves the example images next to the model as `model_file.example_01.jpeg`, `model_file.example_02.jpeg`, ... The number is the position in the civitai list, so each file maps back to its prompt in the info file (and to the API's `/models/{type}/examples` output). "Max images per model" limits how many are saved (0 = all, usually up to 10 per model), "Re-download existing" replaces files that are already there. The setting "Skip NSFW Preview Images" is honored. For a large library this is a lot of files and takes a while; the console log shows the progress. The WebUI ignores these files (they are not previews and not models). They are removed together with the model when you delete a card with the 🗑 button.
+
+## HTTP API
+The extension registers a small REST API on the WebUI at `/civitai-helper/v1`. It is listed in the WebUI's Swagger page (`/docs`) once the app has started and uses the same basic-auth credentials as `--api-auth` when that flag is set. It works without `--api`.
+
+Read-only endpoints answer immediately; long-running work runs on one background worker and is exposed as a *task*: the POST returns the task record, `GET /tasks/{id}` polls it, and `"wait": true` in the POST body blocks (up to `timeout` seconds) so one call can do the whole job. Task status is `queued`, `running`, `done` or `error`.
+
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/version` | extension version, effective settings, model folders |
+| GET | `/model-types` | supported types (`ti`, `hyper`, `ckp`, `lora`) and their folders |
+| GET | `/loras?q=&limit=&offset=&metadata=&compact=&format=json\|csv\|md` | every LoRA: file, `prompt_tag`, civitai name / version / base model / trigger words, training metadata from the safetensors header, example image count |
+| GET | `/models?type=&q=&no_info_only=&empty_info_only=&metadata=&limit=&offset=&format=` | same inventory for any model type |
+| GET | `/models/{type}/info?name=&full=` | stored civitai info of one model (`full=true` adds the raw info file and safetensors metadata) |
+| GET | `/models/{type}/examples?name=` | example images of one model with prompt, negative prompt, steps, sampler, CFG, seed, checkpoint, NSFW flag, civitai URL and the local file / URL when downloaded |
+| GET | `/model-info?url_or_id=` | look up a civitai model by id or page URL: versions (newest first), trigger words, files, target folder and subfolders |
+| POST | `/scan` | body `{"model_types": ["lora"]}`; fetch missing info files and previews (SHA256 match) |
+| POST | `/download` | body `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`; download a version with info file and preview |
+| POST | `/check-new-version` | body `{"model_types": [...]}`; installed models that have a newer version |
+| POST | `/fetch-previews` | body `{"model_types": [...]}` or `{"type", "name"}`; same as the "Fetch Missing Previews" button |
+| POST | `/download-examples` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `max_images` (0 = all) and `overwrite` |
+| POST | `/write-card-info` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `overwrite` and `set_sd_version` |
+| GET | `/tasks`, `/tasks/{id}?wait=&timeout=` | recent tasks / one task |
+
+All task endpoints accept `"wait": true` and `"timeout": <seconds>` in the body. Example:
+
+```bash
+# newest version of a model, into the LoRA folder root, wait for it
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/download \
+  -H 'Content-Type: application/json' \
+  -d '{"url_or_id": "https://civitai.com/models/1676478", "wait": true, "timeout": 600}'
+
+# example prompts of one LoRA
+curl 'http://127.0.0.1:7860/civitai-helper/v1/models/lora/examples?name=Maha-10.safetensors'
+
+# write card descriptions for all LoRAs
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
+  -H 'Content-Type: application/json' -d '{"model_types": ["lora"], "wait": true}'
+```
+
 ## Settings
 Now all settings are moved into Setting tab->civitai helper section. 
 
@@ -150,6 +211,9 @@ Here is a simple tutorial:
 * Click "Add API Key" button, give a name.
 * Copy the api key string, paste to this extension's setting page -> Civitai API Key section.
 * Save setting and Reload SD webui
+
+### Civitai Domain
+Hostname of the civitai instance to call, default `civitai.com`. Mirrors that expose the same `/api/v1` paths (for example `civitai.red`) can be used when the main site is blocked or slow. Model page links opened from the cards use the same domain. Image downloads always go to civitai's image CDN.
 
 ### Content Setting of Civitai
 On your civitai account's setting page, there are sections for "Content Controls" and "Content Moderation".  
@@ -250,6 +314,13 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.12.0 (this fork)
+* New tab section "Example Images & Card Info": Fetch Missing Previews, Write Example Prompt to Cards, Download Example Images.
+* Preview download tries every example image instead of only the first, writes to a temp file first, and understands civitai's `nsfwLevel` field.
+* HTTP API at `/civitai-helper/v1` (inventory, lookup, download, scan, check new version, previews, examples, card info, tasks).
+* Settings are shared between the tab and the API; new "Civitai Domain" setting.
+* Forge / Gradio 4 compatibility fixes; downloader switched to wget with resume, relative redirect and login-redirect handling; model URL opens reliably on mobile browsers.
+
 ## v1.11.2
 * Add "install.py" to install package "pysocks" for using socks for proxy.  
 

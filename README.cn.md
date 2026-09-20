@@ -2,6 +2,14 @@
 近况请参考：[about_version2](about_version2.md) 
 
 
+# 关于本分支
+本分支 (sss22213) 让 Civitai Helper 1.x 能在 **SD WebUI Forge (Classic / Neo)** 与 Gradio 4 上运行，并新增：
+
+* **范例图与卡片信息**（扩展页面中的 "Example Images & Card Info" 区块）：补齐缺失的预览图、把 civitai 上的全部范例图存到模型旁边、把触发词和范例关键词写到 Extra Networks 卡片上。详见[范例图与卡片信息](#范例图与卡片信息)。
+* **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描。详见 [HTTP API](#http-api)。
+* **Civitai Domain** 设置：可改用 `civitai.red` 之类的镜像站。
+* 下载器修正：改用 wget 支持断点续传，处理相对跳转，模型需要 API Key 时给出明确提示。
+
 # Civitai Helper
 Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Civitai模型。
 
@@ -23,6 +31,8 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
   - 🌐: 在新标签页打开这个模型的Civitai页面
   - 💡: 一键添加这个模型的触发词到关键词输入框
   - 🏷: 一键使用这个模型预览图所使用的关键词
+* 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图。
+* HTTP API（本分支，见下文），供脚本与助手使用。
 
 
 # 安装
@@ -112,6 +122,62 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 
 ![](img/get_one_model_info.jpg)  
 
+## 范例图与卡片信息
+每个模型信息文件（`模型名.civitai.info`）本来就保存了该版本在 civitai 上的范例图，多数带有完整生成参数（关键词、负面关键词、步数、采样器、CFG、种子、所用大模型）。原版扩展只拿第一张当预览图，其余没有用到。扩展页面的 "Example Images & Card Info" 区块把它们利用起来。先勾选模型类型，下面每个按钮都会处理这些类型的全部模型。请先执行 "Scan"，信息文件才会存在。
+
+### Fetch Missing Previews（补齐预览图）
+为没有预览图的模型下载 `模型名.preview.png`。会按顺序尝试每一张范例图，取第一张能下载的，所以第一张已在 civitai 上被删除的模型也能拿到预览图。不调用 civitai API，只下载图片，对整个模型库执行也很快。所有范例图都已被删除的模型会列在日志中，需要预览图的话自己放一张 `模型名.png` 在旁边即可。
+
+### Write Example Prompt to Cards（把范例关键词写到卡片）
+写入 WebUI 自己的卡片信息文件 `模型名.json`：
+
+* `description`：触发词、第一个范例的关键词、负面关键词与参数。卡片显示前 3 行，鼠标移上去展开（需开启 WebUI 设置 "Show description on cards"，默认开启）。
+* `notes`：全部范例关键词的完整内容。打开卡片的编辑（铅笔）对话框可查看。
+* `sd version`：由 civitai 的 base model 推导出的 Forge 预设（`sd`、`xl`、`flux` 等），仅在卡片尚未设置时填入。
+
+默认只填空白字段，自己写过的描述和备注会保留；勾选 "Overwrite existing description / notes" 才会覆盖。`activation text`、`preferred weight`、`negative text` 这些用户字段永远不会改动。写完后在 Extra Networks 页面点 "Refresh" 才会看到新描述。
+
+### Download Example Images（下载范例图）
+把范例图存为 `模型名.example_01.jpeg`、`模型名.example_02.jpeg` ……编号就是 civitai 列表中的顺序，因此每张图都能对应回信息文件中的关键词（也对应 API 的 `/models/{type}/examples` 输出）。"Max images per model" 限制每个模型保存几张（0 = 全部，通常每个模型最多 10 张），"Re-download existing" 会重新下载已存在的文件。遵守 "Skip NSFW Preview Images" 设置。模型库很大时文件很多、耗时较长，进度看命令行日志。WebUI 会忽略这些文件（既不是预览图也不是模型）。用卡片上的 🗑 删除模型时会一并删除。
+
+## HTTP API
+扩展在 WebUI 上注册了一组 REST API，路径为 `/civitai-helper/v1`。启动完成后可在 WebUI 的 Swagger 页面（`/docs`）看到；若启动时带了 `--api-auth`，这些接口使用同一组账号密码。不需要 `--api` 参数。
+
+只读接口立即返回；耗时操作在一个后台线程上依次执行，以 *task* 形式暴露：POST 返回任务记录，`GET /tasks/{id}` 轮询，或在 POST 请求体中带 `"wait": true`（最多等待 `timeout` 秒）让一次调用完成整件事。任务状态为 `queued`、`running`、`done`、`error`。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/version` | 扩展版本、生效的设置、模型目录 |
+| GET | `/model-types` | 支持的类型（`ti`、`hyper`、`ckp`、`lora`）及其目录 |
+| GET | `/loras?q=&limit=&offset=&metadata=&compact=&format=json\|csv\|md` | 每个 LoRA：文件名、`prompt_tag`、civitai 名称 / 版本 / base model / 触发词、safetensors 头部的训练信息、已下载范例图数量 |
+| GET | `/models?type=&q=&no_info_only=&empty_info_only=&metadata=&limit=&offset=&format=` | 任意类型的同样清单 |
+| GET | `/models/{type}/info?name=&full=` | 单个模型保存的 civitai 信息（`full=true` 附带原始信息文件与 safetensors 元数据） |
+| GET | `/models/{type}/examples?name=` | 单个模型的范例图：关键词、负面关键词、步数、采样器、CFG、种子、大模型、NSFW 标记、civitai 网址，以及已下载时的本地文件 / 网址 |
+| GET | `/model-info?url_or_id=` | 用 id 或页面网址查询 civitai 模型：版本（最新在前）、触发词、文件、目标目录及子目录 |
+| POST | `/scan` | 请求体 `{"model_types": ["lora"]}`；补齐缺失的信息文件与预览图（SHA256 匹配） |
+| POST | `/download` | 请求体 `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`；下载版本并保存信息文件与预览图 |
+| POST | `/check-new-version` | 请求体 `{"model_types": [...]}`；列出有新版本的本地模型 |
+| POST | `/fetch-previews` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`；等同 "Fetch Missing Previews" 按钮 |
+| POST | `/download-examples` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `max_images`（0 = 全部）与 `overwrite` |
+| POST | `/write-card-info` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `overwrite` 与 `set_sd_version` |
+| GET | `/tasks`、`/tasks/{id}?wait=&timeout=` | 最近的任务 / 单个任务 |
+
+所有任务接口都接受请求体中的 `"wait": true` 与 `"timeout": <秒>`。示例：
+
+```bash
+# 下载某模型的最新版本到 LoRA 根目录并等待完成
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/download \
+  -H 'Content-Type: application/json' \
+  -d '{"url_or_id": "https://civitai.com/models/1676478", "wait": true, "timeout": 600}'
+
+# 单个 LoRA 的范例关键词
+curl 'http://127.0.0.1:7860/civitai-helper/v1/models/lora/examples?name=Maha-10.safetensors'
+
+# 为全部 LoRA 写卡片描述
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
+  -H 'Content-Type: application/json' -d '{"model_types": ["lora"], "wait": true}'
+```
+
 ## 设置
 现在所有设置被移动到 Setting 页面->Civitai Helper区域中。
 
@@ -133,6 +199,9 @@ zixaphir写了一个详细的教程: [wiki](https://github.com/zixaphir/Stable-D
 * 复制生成的api key字符串，粘贴到本扩展设置页面  -> Civitai API Key 部分.
 * 保存设置，并重启SD webui
 
+
+### Civitai Domain
+要调用的 civitai 站点域名，默认 `civitai.com`。主站被封锁或缓慢时，可以填写提供相同 `/api/v1` 路径的镜像站（例如 `civitai.red`）。卡片上打开的模型页面链接也使用该域名；图片始终从 civitai 的图片 CDN 下载。
 
 ### Civitai网站上的内容可见设置
 在你的Civitai帐号设置页面，有一个环节叫做："Content Controls" 和 "Content Moderation".  
