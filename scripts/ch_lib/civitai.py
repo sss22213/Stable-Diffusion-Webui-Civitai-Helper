@@ -11,12 +11,34 @@ from . import setting
 
 suffix = ".civitai"
 
-url_dict = {
-    "modelPage":"https://civitai.com/models/",
-    "modelId": "https://civitai.com/api/v1/models/",
-    "modelVersionId": "https://civitai.com/api/v1/model-versions/",
-    "hash": "https://civitai.com/api/v1/model-versions/by-hash/"
-}
+# Default domain. Overridden by Settings → Civitai Helper → "Civitai Domain"
+# at startup via apply_domain() below; mirrors like civitai.red are
+# wire-compatible with the same /api/v1/... paths.
+DEFAULT_DOMAIN = "civitai.com"
+
+
+def _build_url_dict(domain: str) -> dict:
+    base = f"https://{domain}"
+    return {
+        "modelPage":      f"{base}/models/",
+        "modelId":        f"{base}/api/v1/models/",
+        "modelVersionId": f"{base}/api/v1/model-versions/",
+        "hash":           f"{base}/api/v1/model-versions/by-hash/",
+    }
+
+
+url_dict = _build_url_dict(DEFAULT_DOMAIN)
+
+
+def apply_domain(domain: str):
+    """Repoint all API URLs at the given domain. Falls back to the default
+    on empty input so a blank Settings field doesn't yield bad URLs."""
+    domain = (domain or DEFAULT_DOMAIN).strip().rstrip("/")
+    # Strip an accidentally-pasted scheme: settings UI accepts both
+    # "civitai.red" and "https://civitai.red".
+    if "://" in domain:
+        domain = domain.split("://", 1)[1]
+    url_dict.update(_build_url_dict(domain))
 
 model_type_dict = {
     "Checkpoint": "ckp",
@@ -32,7 +54,7 @@ model_type_dict = {
 # width is in number, not string
 # return: url str
 def get_full_size_image_url(image_url, width):
-    return re.sub('/width=\d+/', '/width=' + str(width) + '/', image_url)
+    return re.sub(r'/width=\d+/', '/width=' + str(width) + '/', image_url)
 
 
 # use this sha256 to get model info from civitai
@@ -365,59 +387,89 @@ def get_model_id_from_url(url:str) -> str:
     return id
 
 
+# is this civitai image entry NSFW?
+# old API: "nsfw": "None" | "Soft" | "Mature" | "X" (or bool)
+# new API: "nsfwLevel": 1 (PG) | 2 (PG13) | 4 (R) | 8 (X) | 16 (XXX)
+def is_nsfw_image(img_dict: dict) -> bool:
+    level = img_dict.get("nsfwLevel")
+    if isinstance(level, int):
+        return level > 1
+    nsfw = img_dict.get("nsfw")
+    if isinstance(nsfw, bool):
+        return nsfw
+    return bool(nsfw) and str(nsfw) != "None"
+
+
+# url of an image at its largest size
+def get_example_image_url(img_dict: dict, max_size: bool) -> str:
+    img_url = img_dict.get("url") or ""
+    if max_size and img_dict.get("width"):
+        # "/width=NNN/" urls can be re-sized; "/original=true/" urls are already full size
+        img_url = get_full_size_image_url(img_url, img_dict["width"])
+    return img_url
+
+
 # get preview image by model path
-# image will be saved to file, so no return
-def get_preview_image_by_model_path(model_path:str, max_size_preview, skip_nsfw_preview):
+# image will be saved to file
+# return: "exists" | "downloaded" | "no_info" | "empty_info" | "no_images" | "failed"
+def get_preview_image_by_model_path(model_path:str, max_size_preview, skip_nsfw_preview) -> str:
     if not model_path:
         util.printD("model_path is empty")
-        return
+        return "failed"
 
     if not os.path.isfile(model_path):
         util.printD("model_path is not a file: "+model_path)
-        return
+        return "failed"
 
     base, ext = os.path.splitext(model_path)
-    first_preview = base+".png"
     sec_preview = base+".preview.png"
     info_file = base + suffix + model.info_ext
 
     # check preview image
-    if not os.path.isfile(sec_preview):
-        # need to download preview image
-        util.printD("Checking preview image for model: " + model_path)
-        # load model_info file
-        if os.path.isfile(info_file):
-            model_info = model.load_model_info(info_file)
-            if not model_info:
-                util.printD("Model Info is empty")
-                return
+    if os.path.isfile(sec_preview):
+        return "exists"
 
-            if "images" in model_info.keys():
-                if model_info["images"]:
-                    for img_dict in model_info["images"]:
-                        if "nsfw" in img_dict.keys():
-                            if img_dict["nsfw"] and img_dict["nsfw"] != "None":
-                                util.printD("This image is NSFW")
-                                if skip_nsfw_preview:
-                                    util.printD("Skip NSFW image")
-                                    continue
+    # need to download preview image
+    util.printD("Checking preview image for model: " + model_path)
+    if not os.path.isfile(info_file):
+        return "no_info"
 
-                        preview_type = img_dict.get("type")
-                        if preview_type != "image":
-                            util.printD(f"Unsupported preview type: {preview_type}, ignore.")
-                            continue
-                        
-                        if "url" in img_dict.keys():
-                            img_url = img_dict["url"]
-                            if max_size_preview:
-                                # use max width
-                                if "width" in img_dict.keys():
-                                    if img_dict["width"]:
-                                        img_url = get_full_size_image_url(img_url, img_dict["width"])
+    model_info = model.load_model_info(info_file)
+    if not model_info:
+        util.printD("Model Info is empty")
+        return "empty_info"
 
-                            util.download_file(img_url, sec_preview)
-                            # we only need 1 preview image
-                            break
+    images = model_info.get("images") or []
+    if not images:
+        return "no_images"
+
+    tried = 0
+    for img_dict in images:
+        if is_nsfw_image(img_dict):
+            util.printD("This image is NSFW")
+            if skip_nsfw_preview:
+                util.printD("Skip NSFW image")
+                continue
+
+        preview_type = img_dict.get("type")
+        if preview_type != "image":
+            util.printD(f"Unsupported preview type: {preview_type}, ignore.")
+            continue
+
+        img_url = get_example_image_url(img_dict, max_size_preview)
+        if not img_url:
+            continue
+
+        tried += 1
+        # we only need 1 preview image; if this one fails (deleted on civitai, network error)
+        # fall through to the next example image instead of giving up
+        if util.download_file(img_url, sec_preview):
+            return "downloaded"
+        util.printD("Preview download failed, trying next example image")
+
+    if tried:
+        util.printD("All example images failed to download for: " + model_path)
+    return "failed"
 
 
 

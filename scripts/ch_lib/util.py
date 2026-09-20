@@ -48,22 +48,41 @@ def gen_file_sha256(filname):
 
 
 
-# get preview image
-def download_file(url, path):
+# download a file (preview / example image) to path.
+# writes to a temp file first so a failed download never leaves a broken image behind.
+# return: True on success, False on failure
+def download_file(url, path, timeout=(15, 120)) -> bool:
     printD("Downloading file from: " + url)
-    # get file
-    r = requests.get(url, stream=True, headers=def_headers, proxies=proxies)
+    real_path = os.path.realpath(path)
+    tmp_path = real_path + ".part"
+    try:
+        r = requests.get(url, stream=True, headers=def_headers, proxies=proxies, timeout=timeout)
+    except requests.RequestException as e:
+        printD(f"Download failed: {e}")
+        return False
+
     if not r.ok:
         printD("Get error code: " + str(r.status_code))
-        printD(r.text)
-        return
-    
-    # write to file
-    with open(os.path.realpath(path), 'wb') as f:
-        r.raw.decode_content = True
-        shutil.copyfileobj(r.raw, f)
+        printD(r.text[:300])
+        return False
+
+    try:
+        with open(tmp_path, 'wb') as f:
+            r.raw.decode_content = True
+            shutil.copyfileobj(r.raw, f)
+        if os.path.getsize(tmp_path) == 0:
+            raise IOError("empty response body")
+        os.replace(tmp_path, real_path)
+    except Exception as e:
+        printD(f"Download failed while writing {path}: {e}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
 
     printD("File downloaded to: " + path)
+    return True
 
 # get subfolder list
 def get_subfolders(folder:str) -> list:

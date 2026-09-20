@@ -22,6 +22,9 @@ from scripts.ch_lib import js_action_civitai
 from scripts.ch_lib import model_action_civitai
 from scripts.ch_lib import civitai
 from scripts.ch_lib import util
+from scripts.ch_lib import ch_settings
+from scripts.ch_lib import examples
+from scripts.ch_lib import api as ch_api
 
 
 # init
@@ -46,6 +49,7 @@ def on_ui_settings():
     shared.opts.add_option("ch_check_new_ver_exist_in_all_folder", shared.OptionInfo(True, "When checking new model version, check new version existing in all model folders", gr.Checkbox, {"interactive": True}, section=ch_section))
     shared.opts.add_option("ch_proxy", shared.OptionInfo("", "Civitai Helper Proxy", gr.Textbox, {"interactive": True, "lines":1, "info":"format: socks5h://127.0.0.1:port"}, section=ch_section))
     shared.opts.add_option("ch_civiai_api_key", shared.OptionInfo("", "Civitai API Key", gr.Textbox, {"interactive": True, "lines":1, "info":"check doc:https://github.com/zixaphir/Stable-Diffusion-Webui-Civitai-Helper/tree/master#api-key"}, section=ch_section))
+    shared.opts.add_option("ch_civitai_domain", shared.OptionInfo(civitai.DEFAULT_DOMAIN, "Civitai Domain", gr.Textbox, {"interactive": True, "lines": 1, "info": "Hostname of the civitai instance to call. Default civitai.com; mirrors like civitai.red use the same /api/v1 paths."}, section=ch_section))
 
 def on_ui_tabs():
     # init
@@ -65,36 +69,13 @@ def on_ui_tabs():
     img2img_neg_prompt = modules.ui.img2img_paste_fields[1][0]
 
 
-    # get settings
-    max_size_preview = shared.opts.data.get("ch_max_size_preview", True)
-    skip_nsfw_preview = shared.opts.data.get("ch_skip_nsfw_preview", False)
-    open_url_with_js = shared.opts.data.get("ch_open_url_with_js", True)
-    check_new_ver_exist_in_all_folder = shared.opts.data.get("ch_check_new_ver_exist_in_all_folder", False)
-    proxy = shared.opts.data.get("ch_proxy", "")
-    civitai_api_key = shared.opts.data.get("ch_civiai_api_key", "")
-
-    util.printD("Settings:")
-    util.printD("max_size_preview: " + str(max_size_preview))
-    util.printD("skip_nsfw_preview: " + str(skip_nsfw_preview))
-    util.printD("open_url_with_js: " + str(open_url_with_js))
-    util.printD("check_new_ver_exist_in_all_folder: " + str(check_new_ver_exist_in_all_folder))
-    util.printD("proxy: " + str(proxy))
-
-    # set civitai_api_key
-    has_api_key = False
-    if civitai_api_key:
-        has_api_key = True
-        util.civitai_api_key = civitai_api_key
-        util.def_headers["Authorization"] = f"Bearer {civitai_api_key}"
-
-    util.printD(f"use civitai api key: {has_api_key}")
-
-    # set proxy
-    if proxy:
-        util.proxies = {
-            "http": proxy,
-            "https": proxy,
-        }
+    # get settings (shared with the HTTP API, see ch_lib/ch_settings.py);
+    # this also applies the api key / proxy / civitai domain globally.
+    ch = ch_settings.load(verbose=True)
+    max_size_preview = ch["max_size_preview"]
+    skip_nsfw_preview = ch["skip_nsfw_preview"]
+    open_url_with_js = ch["open_url_with_js"]
+    check_new_ver_exist_in_all_folder = ch["check_new_ver_exist_in_all_folder"]
 
 
     # ====Event's function====
@@ -116,10 +97,44 @@ def on_ui_tabs():
     def dl_model_new_version(js_msg_txtbox, max_size_preview):
         return js_action_civitai.dl_model_new_version(js_msg_txtbox, max_size_preview, skip_nsfw_preview)
 
+    # ---- examples / card info (same helpers as the HTTP API, see ch_lib/examples.py) ----
+    def _md_report(r):
+        msg = r.get("message", "")
+        extra = []
+        for key, label in (("failed_models", "Failed"), ("models_with_failures", "Models with failed images"),
+                           ("bad_json_models", "Skipped (invalid .json)")):
+            items = r.get(key) or []
+            if items:
+                shown = "<br>".join(items[:30]) + ("<br>…" if len(items) > 30 else "")
+                extra.append(f"**{label} ({len(items)}):**<br>{shown}")
+        return msg + ("<br><br>" + "<br><br>".join(extra) if extra else "")
+
+    def fetch_previews(model_types):
+        if not model_types:
+            return "Model Types is empty"
+        s = ch_settings.load()
+        return _md_report(examples.run_fetch_previews(model_types, None, s["max_size_preview"], s["skip_nsfw_preview"]))
+
+    def write_card_info(model_types, overwrite):
+        if not model_types:
+            return "Model Types is empty"
+        return _md_report(examples.run_write_card_info(model_types, None, overwrite, True))
+
+    def download_examples(model_types, max_images, overwrite):
+        if not model_types:
+            return "Model Types is empty"
+        s = ch_settings.load()
+        return _md_report(examples.run_download_examples(
+            model_types, None, int(max_images or 0), s["skip_nsfw_preview"], overwrite, s["max_size_preview"]))
+
 
     def get_model_names_by_input(model_type, empty_info_only):
         names = civitai.get_model_names_by_input(model_type, empty_info_only)
-        return model_name_drop.update(choices=names)
+        # Component.update(...) in Gradio 4.x returns the component itself
+        # (whose internal state holds a _thread.lock), and gradio's queue
+        # deep-copies the handler response — boom. gr.update returns a
+        # plain dict instead.
+        return gr.update(choices=names)
 
     def get_model_info_by_url(url):
         r = model_action_civitai.get_model_info_by_url(url)
@@ -132,7 +147,7 @@ def on_ui_tabs():
         if r:
             model_info, model_name, model_type, subfolders, version_strs = r
 
-        return [model_info, model_name, model_type, dl_subfolder_drop.update(choices=subfolders), dl_version_drop.update(choices=version_strs)]
+        return [model_info, model_name, model_type, gr.update(choices=subfolders), gr.update(choices=version_strs)]
 
     # ====UI====
     with gr.Blocks(analytics_enabled=False) as civitai_helper:
@@ -199,6 +214,31 @@ def on_ui_tabs():
 
         with gr.Box(elem_classes="ch_box"):
             with gr.Column():
+                gr.Markdown("### Example Images & Card Info")
+                gr.Markdown("Uses the example images / prompts already stored in each model's `.civitai.info` (run Scan first). Everything here is also available as HTTP API under `/civitai-helper/v1` (see `/docs`).")
+                with gr.Row():
+                    ex_model_types_ckbg = gr.CheckboxGroup(choices=model_types, label="Model Types", value=["lora"])
+
+                with gr.Row():
+                    ex_fetch_previews_btn = gr.Button(value="Fetch Missing Previews", variant="primary")
+                    gr.Markdown("Re-downloads `.preview.png` for models that have none (tries every example image, no civitai API call).", elem_classes="ch_vpadding")
+                ex_fetch_previews_log_md = gr.Markdown("")
+
+                with gr.Row():
+                    ex_card_overwrite_ckb = gr.Checkbox(label="Overwrite existing description / notes", value=False, elem_classes="ch_vpadding")
+                    ex_write_card_info_btn = gr.Button(value="Write Example Prompt to Cards", variant="primary")
+                gr.Markdown("Writes trigger words + first example prompt into the card's `description`, all example prompts into `notes` (`<model>.json`). Click Refresh in the Extra Networks tab afterwards.")
+                ex_write_card_info_log_md = gr.Markdown("")
+
+                with gr.Row():
+                    ex_max_images_num = gr.Number(label="Max images per model (0 = all)", value=0, precision=0, minimum=0, maximum=100)
+                    ex_dl_overwrite_ckb = gr.Checkbox(label="Re-download existing", value=False, elem_classes="ch_vpadding")
+                    ex_download_examples_btn = gr.Button(value="Download Example Images", variant="primary")
+                gr.Markdown("Saves example images next to the model as `<model>.example_NN.<ext>`; NN matches the order on civitai so each file maps to its prompt. Honors the 'Skip NSFW Preview Images' setting. Takes a while for many models; check console log.")
+                ex_download_examples_log_md = gr.Markdown("")
+
+        with gr.Box(elem_classes="ch_box"):
+            with gr.Column():
                 gr.Markdown("### Other")
                 # save_setting_btn = gr.Button(value="Save Setting")
                 gr.Markdown(value="Settings are moved into Settings Tab->Civitai Helper section")
@@ -234,6 +274,11 @@ def on_ui_tabs():
         # Check models' new version
         check_models_new_version_btn.click(check_models_new_version_to_md, inputs=model_types_ckbg, outputs=check_models_new_version_log_md)
 
+        # Example images & card info
+        ex_fetch_previews_btn.click(fetch_previews, inputs=[ex_model_types_ckbg], outputs=ex_fetch_previews_log_md)
+        ex_write_card_info_btn.click(write_card_info, inputs=[ex_model_types_ckbg, ex_card_overwrite_ckb], outputs=ex_write_card_info_log_md)
+        ex_download_examples_btn.click(download_examples, inputs=[ex_model_types_ckbg, ex_max_images_num, ex_dl_overwrite_ckb], outputs=ex_download_examples_log_md)
+
         # js action
         js_open_url_btn.click(open_model_url, inputs=[js_msg_txtbox], outputs=py_msg_txtbox)
         js_add_trigger_words_btn.click(js_action_civitai.add_trigger_words, inputs=[js_msg_txtbox], outputs=[txt2img_prompt, img2img_prompt])
@@ -250,6 +295,8 @@ def on_ui_tabs():
 
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_ui_tabs(on_ui_tabs)
+# HTTP API under /civitai-helper/v1 (extension-only, see ch_lib/api.py)
+script_callbacks.on_app_started(ch_api.on_app_started)
 
 
 

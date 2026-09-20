@@ -35,6 +35,11 @@ Civitai: [Civitai Url](https://civitai.com/models/16768/civitai-helper-sd-webui-
   - 🌐: Open this model's Civitai url in a new tab
   - 💡: Add this model's trigger words to prompt
   - 🏷: Use this model's preview image's prompt
+* Example images & card info (this fork, section "Example Images & Card Info" in the tab):
+  - **Fetch Missing Previews**: re-download `.preview.png` for models that have none, trying every example image (no Civitai API call).
+  - **Write Example Prompt to Cards**: write trigger words + the first example prompt into the Extra Networks card (`<model>.json`: `description`, all example prompts into `notes`, and the Forge preset in `sd version` when unknown). Existing hand-written fields are kept unless "Overwrite" is checked.
+  - **Download Example Images**: save every example image next to the model as `<model>.example_NN.<ext>` (NN = position in the Civitai list, so the file maps back to its prompt in `.civitai.info`). Honors "Skip NSFW Preview Images".
+* HTTP API under `/civitai-helper/v1` (listed in the WebUI's `/docs`): model inventory (`/loras`, `/models`, `/models/{type}/info`, `/models/{type}/examples`), Civitai lookup (`/model-info`) and background tasks (`/scan`, `/download`, `/check-new-version`, `/fetch-previews`, `/download-examples`, `/write-card-info`, polled via `/tasks/{id}` or run with `"wait": true`). Task endpoints take either `model_types: [...]` or a single model as `type` + `name`.
 
 # Install
 Go to SD webui's extension tab, go to `Install from url` sub-tab.

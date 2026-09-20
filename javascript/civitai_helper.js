@@ -216,6 +216,16 @@ async function open_model_url(event, model_type, search_term){
         return
     }
 
+    // open the tab NOW, while still inside the tap gesture: popup blockers
+    // (especially on mobile browsers) discard window.open calls that happen
+    // after an await; the tab is navigated or closed once python answers
+    let ch_url_tab = null;
+    try {
+        ch_url_tab = window.open("about:blank", "_blank");
+    } catch (error) {
+        ch_url_tab = null;
+    }
+
 
     //msg to python side
     let msg = {
@@ -249,17 +259,27 @@ async function open_model_url(event, model_type, search_term){
     console.log(new_py_msg);
 
     //check msg
-    if (new_py_msg) {
-        let py_msg_json = JSON.parse(new_py_msg);
-        //check for url
-        if (py_msg_json && py_msg_json.content) {
-            if (py_msg_json.content.url) {
-                window.open(py_msg_json.content.url, "_blank");
+    let ch_opened_url = false;
+    try {
+        if (new_py_msg) {
+            let py_msg_json = JSON.parse(new_py_msg);
+            //check for url
+            if (py_msg_json && py_msg_json.content && py_msg_json.content.url) {
+                if (ch_url_tab) {
+                    ch_url_tab.location.href = py_msg_json.content.url;
+                } else {
+                    window.open(py_msg_json.content.url, "_blank");
+                }
+                ch_opened_url = true;
             }
-
         }
+    } catch (error) {
+        console.log(error);
+    }
 
-
+    // don't leave a blank tab behind when no url came back
+    if (!ch_opened_url && ch_url_tab) {
+        ch_url_tab.close();
     }
 
 
@@ -449,6 +469,16 @@ async function open_model_url_with_path(event, model_type, model_path){
         return
     }
 
+    // open the tab NOW, while still inside the tap gesture: popup blockers
+    // (especially on mobile browsers) discard window.open calls that happen
+    // after an await; the tab is navigated or closed once python answers
+    let ch_url_tab = null;
+    try {
+        ch_url_tab = window.open("about:blank", "_blank");
+    } catch (error) {
+        ch_url_tab = null;
+    }
+
 
     //msg to python side
     let msg = {
@@ -482,17 +512,27 @@ async function open_model_url_with_path(event, model_type, model_path){
     console.log(new_py_msg);
 
     //check msg
-    if (new_py_msg) {
-        let py_msg_json = JSON.parse(new_py_msg);
-        //check for url
-        if (py_msg_json && py_msg_json.content) {
-            if (py_msg_json.content.url) {
-                window.open(py_msg_json.content.url, "_blank");
+    let ch_opened_url = false;
+    try {
+        if (new_py_msg) {
+            let py_msg_json = JSON.parse(new_py_msg);
+            //check for url
+            if (py_msg_json && py_msg_json.content && py_msg_json.content.url) {
+                if (ch_url_tab) {
+                    ch_url_tab.location.href = py_msg_json.content.url;
+                } else {
+                    window.open(py_msg_json.content.url, "_blank");
+                }
+                ch_opened_url = true;
             }
-
         }
+    } catch (error) {
+        console.log(error);
+    }
 
-
+    // don't leave a blank tab behind when no url came back
+    if (!ch_opened_url && ch_url_tab) {
+        ch_url_tab.close();
     }
 
 

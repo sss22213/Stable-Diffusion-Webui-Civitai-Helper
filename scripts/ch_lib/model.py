@@ -42,17 +42,23 @@ def get_custom_model_folder():
 
     global folders
 
-    if shared.cmd_opts.embeddings_dir and os.path.isdir(shared.cmd_opts.embeddings_dir):
-        folders["ti"] = shared.cmd_opts.embeddings_dir
+    # Forge dropped several --*_dir CLI flags that exist in upstream A1111;
+    # fall back to None so the defaults in `folders` survive.
+    embeddings_dir = getattr(shared.cmd_opts, "embeddings_dir", None)
+    if embeddings_dir and os.path.isdir(embeddings_dir):
+        folders["ti"] = embeddings_dir
 
-    if shared.cmd_opts.hypernetwork_dir and os.path.isdir(shared.cmd_opts.hypernetwork_dir):
-        folders["hyper"] = shared.cmd_opts.hypernetwork_dir
+    hypernetwork_dir = getattr(shared.cmd_opts, "hypernetwork_dir", None)
+    if hypernetwork_dir and os.path.isdir(hypernetwork_dir):
+        folders["hyper"] = hypernetwork_dir
 
-    if shared.cmd_opts.ckpt_dir and os.path.isdir(shared.cmd_opts.ckpt_dir):
-        folders["ckp"] = shared.cmd_opts.ckpt_dir
+    ckpt_dir = getattr(shared.cmd_opts, "ckpt_dir", None)
+    if ckpt_dir and os.path.isdir(ckpt_dir):
+        folders["ckp"] = ckpt_dir
 
-    if shared.cmd_opts.lora_dir and os.path.isdir(shared.cmd_opts.lora_dir):
-        folders["lora"] = shared.cmd_opts.lora_dir
+    lora_dir = getattr(shared.cmd_opts, "lora_dir", None)
+    if lora_dir and os.path.isdir(lora_dir):
+        folders["lora"] = lora_dir
 
 
 

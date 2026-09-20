@@ -1,6 +1,8 @@
 import os
 import shlex
 import subprocess
+from urllib.parse import urljoin, urlparse
+
 import requests
 
 from scripts.ch_lib import util
@@ -72,6 +74,21 @@ def dl(url, folder, filename, filepath):
     location = r.headers.get("Location")
     if not location:
         util.printD("No Location header found from civitai redirect response.")
+        return None
+
+    # Civitai sometimes returns a relative Location (e.g. /login?...), which
+    # wget rejects with "Scheme missing". Resolve it against the request URL
+    # so we always hand wget a fully-qualified URL.
+    if not urlparse(location).scheme:
+        location = urljoin(r.url, location)
+
+    # If we land on /login it means civitai wants auth for this model.
+    # No point firing wget — it would just download an HTML login page.
+    if "/login" in urlparse(location).path:
+        if util.civitai_api_key:
+            util.printD("Got a login redirect even with an API key — the key may be invalid, expired, or lack access to this model.")
+        else:
+            util.printD("Civitai requires an API key for this model. Set Settings → Civitai Helper → 'Civitai API Key' and try again.")
         return None
 
     util.printD("Redirect location obtained (download URL).")

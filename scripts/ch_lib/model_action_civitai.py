@@ -186,7 +186,7 @@ def check_models_new_version_to_md(model_types:list, check_new_ver_exist_in_all_
 
             # preview image            
             if img_url:
-                part = part + f"<img src='{img_url}'><br>"
+                part = part + f"<img src='{img_url}' style='max-width:100%;height:auto;'><br>"
                 
 
             output = output + part

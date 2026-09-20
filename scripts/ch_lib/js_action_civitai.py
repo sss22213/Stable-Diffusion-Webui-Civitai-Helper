@@ -9,6 +9,7 @@ from . import model
 from . import civitai
 from . import msg_handler
 from . import downloader
+from . import examples
 
 
 
@@ -341,6 +342,9 @@ def remove_model_by_path(msg):
 
     if os.path.isfile(info_path):
         related_paths.append(info_path)
+
+    # example images saved by "Download Example Images"
+    related_paths.extend(examples.example_files(model_path))
 
     # remove files
     for rp in related_paths:
