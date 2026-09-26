@@ -23,6 +23,7 @@ or
 This fork (sss22213) keeps Civitai Helper 1.x working on **SD WebUI Forge (Classic / Neo)** with Gradio 4 and adds:
 
 * **Example images & card info** (tab section "Example Images & Card Info"): restore missing previews, save every civitai example image next to the model, and write trigger words + example prompts onto the Extra Networks cards. See [Example Images & Card Info](#example-images--card-info).
+* **User-posted example images**: save images that other civitai users made with a model (picked by image id, or "everything user X made with this LoRA") as extra examples with their prompts, next to the civitai ones. HTTP API only, see [Download Example Images](#download-example-images).
 * **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models and run scans. See [HTTP API](#http-api).
 * **Civitai Domain** setting for mirrors such as `civitai.red`.
 * Downloader fixes: wget based download with resume, relative redirect handling, clear message when a model needs an API key.
@@ -43,7 +44,7 @@ Civitai: [Civitai Url](https://civitai.com/models/16768/civitai-helper-sd-webui-
   - 🌐: Open this model's Civitai url in a new tab
   - 💡: Add this model's trigger words to prompt
   - 🏷: Use this model's preview image's prompt
-* Example images & card info (this fork, see below): fetch missing previews, write example prompts onto the cards, download all example images.
+* Example images & card info (this fork, see below): fetch missing previews, write example prompts onto the cards, download all example images, and add images other civitai users posted as extra examples (API).
 * HTTP API (this fork, see below) for scripts and assistants.
 
 # Install
@@ -153,6 +154,15 @@ By default only empty fields are filled, so descriptions and notes you wrote you
 ### Download Example Images
 Saves the example images next to the model as `model_file.example_01.jpeg`, `model_file.example_02.jpeg`, ... The number is the position in the civitai list, so each file maps back to its prompt in the info file (and to the API's `/models/{type}/examples` output). "Max images per model" limits how many are saved (0 = all, usually up to 10 per model), "Re-download existing" replaces files that are already there. The setting "Skip NSFW Preview Images" is honored. For a large library this is a lot of files and takes a while; the console log shows the progress. The WebUI ignores these files (they are not previews and not models). They are removed together with the model when you delete a card with the 🗑 button.
 
+Images that other civitai users posted (for example everything user X made with this LoRA) can be added as extra examples through the HTTP API (`/add-user-examples`), either by civitai image id or by username:
+
+* **By image id** (`image_ids`): the images you picked, e.g. from a civitai image search. Ids that civitai does not return are listed as `not_found`.
+* **By username** (`username`): that user's still images made with this model's own version, taken from its info file (run "Scan" first, or pass `model_version_id`). `all_versions` also accepts every other version of the same civitai model. `max_images` (default 10, up to 200) caps the number; `sort` and `period` work as on civitai.
+
+They are numbered from 101 (`model_file.example_101.jpeg`) so they never collide with the civitai list, and their prompts, parameters, the LoRAs they used and their author are kept in `model_file.examples.json`. Adding the same image again keeps its number (`overwrite` re-downloads it). Images that already are in the model's civitai example list are not added twice, and videos are skipped. NSFW images are included unless `skip_nsfw` is set (or `nsfw` limits the search level); the "Skip NSFW Preview Images" setting does not apply here.
+
+`/models/{type}/examples` lists them after the civitai examples with `"source": "user"`, the username, the civitai image page and the LoRAs used. "Write Example Prompt to Cards" adds their prompts to the card notes as "Example #101 (by X on civitai)". `/remove-user-examples` deletes them by image id, number or all at once, and deleting the card with 🗑 removes them together with the model.
+
 ## HTTP API
 The extension registers a small REST API on the WebUI at `/civitai-helper/v1`. It is listed in the WebUI's Swagger page (`/docs`) once the app has started and uses the same basic-auth credentials as `--api-auth` when that flag is set. It works without `--api`.
 
@@ -173,6 +183,8 @@ Read-only endpoints answer immediately; long-running work runs on one background
 | POST | `/fetch-previews` | body `{"model_types": [...]}` or `{"type", "name"}`; same as the "Fetch Missing Previews" button |
 | POST | `/download-examples` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `max_images` (0 = all) and `overwrite` |
 | POST | `/write-card-info` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `overwrite` and `set_sd_version` |
+| POST | `/add-user-examples` | save images that civitai users posted as extra examples of one model (`model_file.example_101.jpeg`, …): body `{"type", "name"}` plus either `image_ids` (e.g. picked from a civitai image search) or `username` (that user's images made with this model's version; `all_versions`, `max_images`, `sort`, `period`); NSFW images are included by default (`nsfw` = highest level to search, `"None"` for SFW only; `skip_nsfw` drops NSFW images), videos are skipped |
+| POST | `/remove-user-examples` | body `{"type", "name"}` plus `image_ids`, `indexes` or `all: true` |
 | GET | `/tasks`, `/tasks/{id}?wait=&timeout=` | recent tasks / one task |
 
 All task endpoints accept `"wait": true` and `"timeout": <seconds>` in the body. Example:
@@ -189,6 +201,11 @@ curl 'http://127.0.0.1:7860/civitai-helper/v1/models/lora/examples?name=Maha-10.
 # write card descriptions for all LoRAs
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
   -H 'Content-Type: application/json' -d '{"model_types": ["lora"], "wait": true}'
+
+# add the 10 newest images user "someone" made with one LoRA as examples #101+
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
 ```
 
 ## Settings
@@ -314,6 +331,11 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.13.0 (this fork)
+* HTTP API `/add-user-examples`: save images that civitai users posted (by image id, or a user's images made with this model's version) as extra examples #101+, with their prompts, parameters, LoRAs used and author in `model_file.examples.json`. `/remove-user-examples` deletes them.
+* `/models/{type}/examples` lists these user examples, and "Write Example Prompt to Cards" adds their prompts to the card notes.
+* Deleting a model with 🗑 also removes its user examples and the `.examples.json` file.
+
 ## v1.12.0 (this fork)
 * New tab section "Example Images & Card Info": Fetch Missing Previews, Write Example Prompt to Cards, Download Example Images.
 * Preview download tries every example image instead of only the first, writes to a temp file first, and understands civitai's `nsfwLevel` field.

@@ -343,8 +343,9 @@ def remove_model_by_path(msg):
     if os.path.isfile(info_path):
         related_paths.append(info_path)
 
-    # example images saved by "Download Example Images"
+    # example images saved by "Download Example Images" / the add-user-examples API
     related_paths.extend(examples.example_files(model_path))
+    related_paths.append(examples.user_sidecar_path(model_path))
 
     # remove files
     for rp in related_paths:

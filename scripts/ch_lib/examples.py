@@ -16,6 +16,13 @@ card preview. This module makes the rest usable:
                         Extra Networks card and in its edit dialog)
 * fetch_preview()       (re)download the missing `<model>.preview.png`
 * list_examples()       everything above as data, for the HTTP API
+* add_user_examples()   save images that civitai *users* posted (found with
+                        GET /api/v1/images, e.g. "what user X made with this
+                        LoRA") as extra examples `<model>.example_101.<ext>`…
+                        Their prompts live in the sidecar `<model>.examples.json`
+                        because they are not part of the civitai info file.
+
+Numbering: 1-100 = position in the civitai info list, 101-999 = user images.
 
 All three "run_*" helpers below take a list of model types (ti / hyper /
 ckp / lora) or one (type, path) pair, and are shared by the Gradio buttons
@@ -34,6 +41,9 @@ from . import local_models
 
 
 EXAMPLE_TAG = ".example_"
+USER_BASE = 101              # first index used for user-posted example images
+USER_MAX = 999
+USER_SIDECAR = ".examples.json"
 EXAMPLE_RE = re.compile(r"\.example_(\d{2,3})\.(png|jpe?g|webp|gif)$", re.IGNORECASE)
 IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif")
 DESC_PROMPT_LIMIT = 600      # card description: chars of example prompt kept
@@ -138,6 +148,8 @@ def info_images(info: dict) -> list:
     """(index, img) for every entry of info["images"] that is a still image."""
     out = []
     for i, img in enumerate(info.get("images") or [], 1):
+        if i >= USER_BASE:
+            break
         if not isinstance(img, dict):
             continue
         if img.get("type") not in (None, "image"):
@@ -215,6 +227,12 @@ def list_examples(model_type: str, folder: str, path: str) -> dict:
             v["local_file"] = util.get_relative_path(lp, folder).replace("\\", "/") if lp else None
             v["local_url"] = thumb_url(lp) if lp else None
             images.append(v)
+    for entry in load_user_examples(path):
+        v = user_image_view(entry)
+        lp = local.get(v["index"])
+        v["local_file"] = util.get_relative_path(lp, folder).replace("\\", "/") if lp else None
+        v["local_url"] = thumb_url(lp) if lp else None
+        images.append(v)
     known = {v["index"] for v in images}
     for index, lp in sorted(local.items()):
         if index in known:
@@ -239,8 +257,190 @@ def list_examples(model_type: str, folder: str, path: str) -> dict:
         "has_card_info": os.path.isfile(card_json),
         "downloaded": len(local),
         "total": len(images),
+        "user_images": sum(1 for v in images if v.get("source") == "user"),
         "images": images,
     }
+
+
+# ---------------------------------------------------------------------------
+# user-posted images as extra examples (<model>.example_101+ + sidecar json)
+# ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_META_KEYS = ("prompt", "negativePrompt", "steps", "sampler", "cfgScale", "seed", "Size", "clipSkip",
+              "Clip skip", "Model", "resources", "civitaiResources", "baseModel")
+_LORA_TYPES = ("lora", "locon", "lycoris", "dora")
+
+
+def user_sidecar_path(model_path: str) -> str:
+    base, _ = os.path.splitext(model_path)
+    return base + USER_SIDECAR
+
+
+def load_user_examples(model_path: str) -> list:
+    """Entries of `<model>.examples.json`, sorted by index ([] when absent / broken)."""
+    p = user_sidecar_path(model_path)
+    if not os.path.isfile(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception as e:
+        util.printD(f"Can not read {p}: {e}")
+        return []
+    items = data.get("images") if isinstance(data, dict) else None
+    return sorted((e for e in items or [] if isinstance(e, dict) and e.get("index")), key=lambda e: e["index"])
+
+
+def _save_user_examples(model_path: str, entries: list):
+    p = user_sidecar_path(model_path)
+    if not entries:
+        if os.path.isfile(p):
+            os.remove(p)
+        return
+    tmp = p + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "images": sorted(entries, key=lambda e: e["index"])}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, p)
+
+
+def image_key(url: str) -> str:
+    """Identity of a civitai image across API shapes: the UUID in its URL path."""
+    m = _UUID_RE.search(url or "")
+    return m.group(0).lower() if m else (url or "")
+
+
+def _nsfw(level, flag) -> bool:
+    if isinstance(level, int):
+        return level > 1
+    if isinstance(level, str) and level:
+        return level != "None"
+    return bool(flag)
+
+
+def used_loras(meta: dict) -> list:
+    """'name:weight' of the LoRAs an image was generated with (best effort from its meta)."""
+    out = []
+    for r in meta.get("resources") or []:
+        if isinstance(r, dict) and str(r.get("type") or "").lower() in _LORA_TYPES and r.get("name"):
+            out.append(f"{r['name']}:{r.get('weight', 1)}")
+    for r in meta.get("civitaiResources") or []:
+        if isinstance(r, dict) and str(r.get("type") or "").lower() in _LORA_TYPES:
+            name = r.get("modelVersionName") or f"version {r.get('modelVersionId')}"
+            out.append(f"{name} (v{r.get('modelVersionId')}):{r.get('weight', 1)}")
+    return list(dict.fromkeys(out))
+
+
+def user_image_view(entry: dict) -> dict:
+    """Same shape as image_view(), plus who posted it and where."""
+    meta = entry.get("meta") or {}
+    v = image_view(entry["index"], {
+        "url": entry.get("url"), "type": "image", "width": entry.get("width"), "height": entry.get("height"),
+        "nsfwLevel": entry.get("nsfw_level"), "meta": meta,
+    })
+    v["nsfw"] = bool(entry.get("nsfw"))
+    v.update({
+        "source": "user",
+        "image_id": entry.get("id"),
+        "username": entry.get("username"),
+        "post_id": entry.get("post_id"),
+        "page_url": (civitai.url_dict["imagePage"] + str(entry["id"])) if entry.get("id") else None,
+        "loras": used_loras(meta),
+        "added_at": entry.get("added_at"),
+    })
+    return v
+
+
+def add_user_examples(path: str, images: list, skip_nsfw: bool = False, overwrite: bool = False,
+                      max_size: bool = True) -> dict:
+    """Save civitai image records (GET /api/v1/images items, with meta) as
+    extra examples of the model at `path`. Already-added images keep their
+    number; images that are part of the model's own civitai example list are
+    skipped (they are examples #1-#100 already)."""
+    r = {"path": path, "status": "ok", "added": 0, "existed": 0, "skipped_nsfw": 0, "skipped_video": 0,
+         "in_civitai_list": 0, "failed": 0, "images": []}
+    entries = load_user_examples(path)
+    by_id = {e.get("id"): e for e in entries}
+    info = load_info(path)
+    info_keys = {image_key(img.get("url")): i for i, img in info_images(info)} if info else {}
+    used = {e["index"] for e in entries} | {i for i in (example_index_of(p) for p in example_files(path)) if i}
+    next_index = max([USER_BASE - 1] + [i for i in used if i >= USER_BASE]) + 1
+
+    for img in images:
+        if not isinstance(img, dict) or not img.get("url"):
+            continue
+        iid = img.get("id")
+        row = {"image_id": iid, "username": img.get("username")}
+        if img.get("type") not in (None, "image"):
+            r["skipped_video"] += 1
+            continue
+        key = image_key(img["url"])
+        if key in info_keys:
+            r["in_civitai_list"] += 1
+            r["images"].append({**row, "index": info_keys[key], "status": "in_civitai_list"})
+            continue
+        nsfw = _nsfw(img.get("nsfwLevel"), img.get("nsfw"))
+        if skip_nsfw and nsfw:
+            r["skipped_nsfw"] += 1
+            continue
+        entry = by_id.get(iid)
+        is_new = entry is None
+        if is_new:
+            if next_index > USER_MAX:
+                r["status"] = "full"
+                break
+            entry = {"index": next_index}
+        meta = img.get("meta") or {}
+        entry.update({
+            "id": iid, "url": img["url"], "post_id": img.get("postId"), "username": img.get("username"),
+            "width": img.get("width"), "height": img.get("height"), "nsfw": nsfw,
+            "nsfw_level": img.get("nsfwLevel"), "base_model": img.get("baseModel"),
+            "created_at": img.get("createdAt"),
+            "meta": {k: meta[k] for k in _META_KEYS if k in meta},
+        })
+        entry.setdefault("added_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+        url = civitai.get_example_image_url(img, max_size)
+        existing = [p for p in example_files(path) if example_index_of(p) == entry["index"]]
+        if existing and not overwrite:
+            r["existed"] += 1
+            status = "existed"
+        else:
+            for p in existing:
+                os.remove(p)
+            target = example_file_path(path, entry["index"], url)
+            if not util.download_file(url, target):
+                r["failed"] += 1
+                r["images"].append({**row, "status": "failed"})
+                continue
+            r["added"] += 1
+            status = "added"
+        if is_new:
+            next_index += 1
+        by_id[iid] = entry
+        r["images"].append({**row, "index": entry["index"], "status": status})
+    _save_user_examples(path, list(by_id.values()))
+    if r["failed"] and not (r["added"] or r["existed"]) and r["status"] == "ok":
+        r["status"] = "failed"
+    r["total_user_examples"] = len(by_id)
+    return r
+
+
+def remove_user_examples(path: str, image_ids=None, indexes=None, remove_all: bool = False) -> dict:
+    """Delete user example images (files + sidecar entries) by civitai image id or example number."""
+    entries = load_user_examples(path)
+    ids = {int(i) for i in image_ids or []}
+    idx = {int(i) for i in indexes or []}
+    keep, removed = [], []
+    for e in entries:
+        if remove_all or e.get("id") in ids or e["index"] in idx:
+            for p in example_files(path):
+                if example_index_of(p) == e["index"]:
+                    os.remove(p)
+            removed.append({"index": e["index"], "image_id": e.get("id")})
+        else:
+            keep.append(e)
+    _save_user_examples(path, keep)
+    return {"path": path, "removed": removed, "remaining": len(keep)}
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +500,8 @@ def download_examples(path: str, max_images: int = 0, skip_nsfw: bool = False,
 
 def remove_examples(path: str) -> int:
     n = 0
-    for p in example_files(path):
+    sidecar = user_sidecar_path(path)
+    for p in example_files(path) + ([sidecar] if os.path.isfile(sidecar) else []):
         try:
             os.remove(p)
             n += 1
@@ -362,8 +563,8 @@ def build_description(info: dict) -> str:
     return "\n".join(lines)
 
 
-def build_notes(info: dict) -> str:
-    """Every example prompt in full, for the card's edit dialog."""
+def build_notes(info: dict, path: str = None) -> str:
+    """Every example prompt in full (civitai list, then user images), for the card's edit dialog."""
     m = info.get("model") or {}
     head = []
     if m.get("name"):
@@ -381,6 +582,17 @@ def build_notes(info: dict) -> str:
         if not v["prompt"]:
             continue
         b = [f"--- Example #{index} ---", "Prompt: " + v["prompt"].strip()]
+        if v["negative_prompt"]:
+            b.append("Negative prompt: " + v["negative_prompt"].strip())
+        params = _params_line(v)
+        if params:
+            b.append(params)
+        blocks.append("\n".join(b))
+    for entry in (load_user_examples(path) if path else []):
+        v = user_image_view(entry)
+        if not v["prompt"]:
+            continue
+        b = [f"--- Example #{v['index']} (by {v.get('username') or '?'} on civitai) ---", "Prompt: " + v["prompt"].strip()]
         if v["negative_prompt"]:
             b.append("Negative prompt: " + v["negative_prompt"].strip())
         params = _params_line(v)
@@ -430,7 +642,7 @@ def write_card_info(path: str, overwrite: bool = False, set_sd_version: bool = T
         r["fields"].append(key)
 
     put("description", build_description(info))
-    put("notes", build_notes(info))
+    put("notes", build_notes(info, path))
     if set_sd_version:
         sd_version = sd_version_from_base_model(info.get("baseModel"))
         if sd_version and (data.get("sd version") in (None, "", "Unknown") or overwrite):

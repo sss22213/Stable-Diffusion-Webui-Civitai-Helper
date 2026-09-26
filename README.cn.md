@@ -6,6 +6,7 @@
 本分支 (sss22213) 让 Civitai Helper 1.x 能在 **SD WebUI Forge (Classic / Neo)** 与 Gradio 4 上运行，并新增：
 
 * **范例图与卡片信息**（扩展页面中的 "Example Images & Card Info" 区块）：补齐缺失的预览图、把 civitai 上的全部范例图存到模型旁边、把触发词和范例关键词写到 Extra Networks 卡片上。详见[范例图与卡片信息](#范例图与卡片信息)。
+* **用户范例图**：把其他 civitai 用户用某个模型生成的图片（按图片 ID 挑选，或「用户 X 用这个 LoRA 生成的全部图片」）连同关键词存为额外范例，和 civitai 范例放在一起。仅限 HTTP API，详见[范例图与卡片信息](#范例图与卡片信息)。
 * **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描。详见 [HTTP API](#http-api)。
 * **Civitai Domain** 设置：可改用 `civitai.red` 之类的镜像站。
 * 下载器修正：改用 wget 支持断点续传，处理相对跳转，模型需要 API Key 时给出明确提示。
@@ -31,7 +32,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
   - 🌐: 在新标签页打开这个模型的Civitai页面
   - 💡: 一键添加这个模型的触发词到关键词输入框
   - 🏷: 一键使用这个模型预览图所使用的关键词
-* 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图。
+* 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图，并可通过 API 把其他 civitai 用户发布的图片加为额外范例。
 * HTTP API（本分支，见下文），供脚本与助手使用。
 
 
@@ -140,6 +141,15 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 ### Download Example Images（下载范例图）
 把范例图存为 `模型名.example_01.jpeg`、`模型名.example_02.jpeg` ……编号就是 civitai 列表中的顺序，因此每张图都能对应回信息文件中的关键词（也对应 API 的 `/models/{type}/examples` 输出）。"Max images per model" 限制每个模型保存几张（0 = 全部，通常每个模型最多 10 张），"Re-download existing" 会重新下载已存在的文件。遵守 "Skip NSFW Preview Images" 设置。模型库很大时文件很多、耗时较长，进度看命令行日志。WebUI 会忽略这些文件（既不是预览图也不是模型）。用卡片上的 🗑 删除模型时会一并删除。
 
+其他 civitai 用户发布的图片（例如用户 X 用这个 LoRA 生成的全部图片）可以通过 HTTP API（`/add-user-examples`）加为额外范例，有两种方式：
+
+* **按图片 ID**（`image_ids`）：你挑选的图片，例如从 civitai 图片搜索中选出的。civitai 查不到的 ID 会列在 `not_found`。
+* **按用户名**（`username`）：该用户用这个模型本身的版本生成的静态图片，版本取自模型的信息文件（请先执行 "Scan"，或传入 `model_version_id`）。`all_versions` 会同时接受同一个 civitai 模型的其他版本。`max_images`（默认 10，最多 200）限制张数；`sort` 与 `period` 的含义和 civitai 相同。
+
+编号从 101 开始（`模型名.example_101.jpeg`），不会和 civitai 列表冲突；关键词、生成参数、用到的 LoRA 与作者记录在 `模型名.examples.json`。重复加入同一张图会保留原编号（`overwrite` 会重新下载）。已经在模型 civitai 范例列表中的图片不会重复加入，视频会被跳过。默认包含 NSFW 图片，可用 `skip_nsfw` 排除（或用 `nsfw` 限制搜索等级）；"Skip NSFW Preview Images" 设置对此不生效。
+
+`/models/{type}/examples` 会把它们列在 civitai 范例之后，并带有 `"source": "user"`、用户名、civitai 图片页面与用到的 LoRA。"Write Example Prompt to Cards" 会把它们的关键词加到卡片备注中，标题为 "Example #101 (by X on civitai)"。`/remove-user-examples` 可按图片 ID、编号或全部删除；用卡片上的 🗑 删除模型时也会一并删除。
+
 ## HTTP API
 扩展在 WebUI 上注册了一组 REST API，路径为 `/civitai-helper/v1`。启动完成后可在 WebUI 的 Swagger 页面（`/docs`）看到；若启动时带了 `--api-auth`，这些接口使用同一组账号密码。不需要 `--api` 参数。
 
@@ -160,6 +170,8 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 | POST | `/fetch-previews` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`；等同 "Fetch Missing Previews" 按钮 |
 | POST | `/download-examples` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `max_images`（0 = 全部）与 `overwrite` |
 | POST | `/write-card-info` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `overwrite` 与 `set_sd_version` |
+| POST | `/add-user-examples` | 把 civitai 用户发布的图片存为单个模型的额外范例（`模型名.example_101.jpeg`……）：请求体 `{"type", "name"}`，加上 `image_ids`（例如从 civitai 图片搜索挑出的）或 `username`（该用户用这个模型版本生成的图；可选 `all_versions`、`max_images`、`sort`、`period`）；默认包含 NSFW 图片（`nsfw` 为搜索的最高等级，`"None"` 仅 SFW；`skip_nsfw` 可排除 NSFW），视频会被跳过 |
+| POST | `/remove-user-examples` | 请求体 `{"type", "name"}`，加上 `image_ids`、`indexes` 或 `all: true` |
 | GET | `/tasks`、`/tasks/{id}?wait=&timeout=` | 最近的任务 / 单个任务 |
 
 所有任务接口都接受请求体中的 `"wait": true` 与 `"timeout": <秒>`。示例：
@@ -176,6 +188,11 @@ curl 'http://127.0.0.1:7860/civitai-helper/v1/models/lora/examples?name=Maha-10.
 # 为全部 LoRA 写卡片描述
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
   -H 'Content-Type: application/json' -d '{"model_types": ["lora"], "wait": true}'
+
+# 把用户 "someone" 用某个 LoRA 生成的最新 10 张图加为范例 #101 起
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
 ```
 
 ## 设置

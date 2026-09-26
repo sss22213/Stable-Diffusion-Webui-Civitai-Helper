@@ -24,6 +24,8 @@ def _build_url_dict(domain: str) -> dict:
         "modelId":        f"{base}/api/v1/models/",
         "modelVersionId": f"{base}/api/v1/model-versions/",
         "hash":           f"{base}/api/v1/model-versions/by-hash/",
+        "images":         f"{base}/api/v1/images",
+        "imagePage":      f"{base}/images/",
     }
 
 
@@ -762,4 +764,91 @@ def check_models_new_version_by_model_types(model_types:list, delay:float=1, che
     return new_versions
 
 
+# ---------------------------------------------------------------------------
+# images posted by civitai users (GET /api/v1/images)
+# ---------------------------------------------------------------------------
+# The REST API only returns the generation data (`meta`: prompt, sampler, ...)
+# when withMeta=true is passed, and only SFW images unless `nsfw` is given
+# ("None" | "Soft" | "Mature" | "X" = highest level to include).
+# An imageId query ignores withMeta, so single images are looked up via their
+# post (see get_images_by_ids).
+
+IMAGE_SORTS = ("Most Reactions", "Most Comments", "Most Collected", "Newest", "Oldest")
+
+
+def search_images(params: dict, timeout=(15, 60)):
+    """One page of GET /api/v1/images. Returns the response dict, or raises
+    RuntimeError with civitai's message (so API callers can report it)."""
+    q = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    q.setdefault("withMeta", "true")
+    try:
+        r = requests.get(url_dict["images"], params=q, headers=util.def_headers,
+                         proxies=util.proxies, timeout=timeout)
+    except requests.RequestException as e:
+        raise RuntimeError(f"civitai images request failed: {e}")
+    if not r.ok:
+        raise RuntimeError(f"civitai images request failed: HTTP {r.status_code} {r.text[:300]}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("civitai images response is not JSON")
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise RuntimeError(f"unexpected civitai images response: {str(data)[:300]}")
+    return data
+
+
+def iter_images(params: dict, max_images: int, page_size: int = 100):
+    """Yield image records page by page (cursor paging) until max_images."""
+    q = dict(params or {})
+    q["limit"] = max(1, min(page_size, 200, max_images))
+    seen = 0
+    cursor = None
+    while seen < max_images:
+        if cursor:
+            q["cursor"] = cursor
+        data = search_images(q)
+        items = data["items"]
+        for img in items:
+            if seen >= max_images:
+                return
+            seen += 1
+            yield img
+        cursor = (data.get("metadata") or {}).get("nextCursor")
+        if not items or not cursor:
+            return
+
+
+def get_images_by_ids(image_ids, nsfw: str = "X") -> dict:
+    """{image id: record with meta} for the given civitai image ids.
+
+    Missing / deleted ids are simply absent from the result.
+    """
+    out = {}
+    posts = {}
+    for image_id in image_ids:
+        try:
+            iid = int(image_id)
+        except (TypeError, ValueError):
+            continue
+        if iid in out:
+            continue
+        try:  # civitai answers HTTP 500 for ids that never existed
+            found = search_images({"imageId": iid, "nsfw": nsfw})["items"]
+        except RuntimeError as e:
+            util.printD(f"image {iid}: {e}")
+            continue
+        if not found:
+            continue
+        base = found[0]
+        post_id = base.get("postId")
+        if post_id and post_id not in posts:
+            try:
+                posts[post_id] = {img.get("id"): img for img in
+                                  search_images({"postId": post_id, "nsfw": nsfw, "limit": 200})["items"]}
+            except RuntimeError as e:
+                util.printD(f"post {post_id}: {e}")
+                posts[post_id] = {}
+        full = posts.get(post_id, {}).get(iid)
+        out[iid] = full if full else base
+    return out
 

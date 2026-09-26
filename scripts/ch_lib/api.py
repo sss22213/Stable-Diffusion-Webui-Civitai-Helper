@@ -17,6 +17,9 @@ Examples (see ch_lib/examples.py): GET /models/{type}/examples lists a
 model's civitai example images with their prompts and which are on disk;
 POST /fetch-previews, /download-examples and /write-card-info are tasks that
 work on a list of model types or on one model (type + name).
+POST /add-user-examples saves images that civitai users posted (by image id,
+or "everything user X made with this model") as extra examples #101+ of one
+model; POST /remove-user-examples deletes them again.
 
 If the WebUI was started with --api-auth, the same basic-auth credentials
 are required for every route here.
@@ -313,6 +316,29 @@ class WriteCardInfoRequest(TargetRequest):
     set_sd_version: bool = Field(True, description="Also fill the card's 'sd version' (Forge preset) from the civitai base model when it is unknown")
 
 
+class AddUserExamplesRequest(TaskOptions):
+    type: str = Field(..., description="ti | hyper | ckp | lora")
+    name: str = Field(..., description="File name (e.g. foo.safetensors) or path relative to the model folder")
+    image_ids: Optional[List[int]] = Field(None, description="civitai image ids to add (e.g. picked from a civitai image search)")
+    username: Optional[str] = Field(None, description="Instead of image_ids: add images posted by this civitai user that were made with this model")
+    model_version_id: Optional[int] = Field(None, description="Username mode: civitai model version the images must use (default: this model's own version from its .civitai.info)")
+    all_versions: bool = Field(False, description="Username mode: accept any version of the same civitai model")
+    max_images: int = Field(10, ge=1, le=200, description="Username mode: how many images to add at most")
+    sort: Optional[str] = Field(None, description="Username mode: Most Reactions | Most Comments | Most Collected | Newest | Oldest")
+    period: Optional[str] = Field(None, description="Username mode: AllTime | Year | Month | Week | Day")
+    nsfw: str = Field("X", description="Username mode: highest NSFW level to search (None | Soft | Mature | X); default X = everything, None = SFW only")
+    skip_nsfw: bool = Field(False, description="Skip NSFW images (default false; independent of the 'Skip NSFW Preview Images' setting)")
+    overwrite: bool = Field(False, description="Re-download images that were already added")
+
+
+class RemoveUserExamplesRequest(BaseModel):
+    type: str = Field(..., description="ti | hyper | ckp | lora")
+    name: str = Field(..., description="File name or path relative to the model folder")
+    image_ids: Optional[List[int]] = Field(None, description="civitai image ids to remove")
+    indexes: Optional[List[int]] = Field(None, description="Example numbers to remove (101 and up)")
+    all: bool = Field(False, description="Remove every user-added example of this model")
+
+
 class DownloadRequest(TaskOptions):
     url_or_id: str = Field(..., description="civitai model id or model page URL")
     version_id: Optional[int] = Field(None, description="Version id to download (default: newest)")
@@ -320,6 +346,28 @@ class DownloadRequest(TaskOptions):
     subfolder: str = Field("/", description="Subfolder under the model type's folder, e.g. '/' or '/characters'")
     create_subfolder: bool = False
     dl_all: bool = Field(False, description="Download every file of the version, not only the primary one")
+
+
+def _user_images(username: str, version_ids: List[int], max_images: int, sort, period, nsfw):
+    """Still images `username` posted with any of `version_ids` (in that order), up to max_images.
+
+    Videos are skipped without counting towards max_images; at most max(100, 10x max_images)
+    records (1000 at most) are scanned per version so a user with only videos does not page forever.
+    Returns (images, videos_skipped).
+    """
+    out, seen, videos = [], set(), 0
+    for vid in version_ids:
+        params = {"username": username, "modelVersionId": vid, "sort": sort, "period": period, "nsfw": nsfw}
+        for img in civitai.iter_images(params, min(1000, max(100, max_images * 10))):
+            if img.get("type") not in (None, "image"):
+                videos += 1
+                continue
+            if img.get("id") not in seen:
+                seen.add(img.get("id"))
+                out.append(img)
+            if len(out) >= max_images:
+                return out, videos
+    return out, videos
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +526,68 @@ def build_router() -> APIRouter:
 
         task = _submit("write_card_info", params, run)
         return _task_response(task, req.wait, req.timeout)
+
+    @router.post("/add-user-examples", summary="Save images civitai users posted as extra examples (#101+) of one local model")
+    def post_add_user_examples(req: AddUserExamplesRequest):
+        _check_model_type(req.type)
+        _folder, _root, path, filename = _find_local_model(req.type, req.name)
+        if not req.image_ids and not (req.username or "").strip():
+            raise HTTPException(400, "give image_ids, or a username to take that user's images made with this model")
+        if req.nsfw and req.nsfw not in ("None", "Soft", "Mature", "X"):
+            raise HTTPException(400, "nsfw must be one of None, Soft, Mature, X")
+        if req.sort and req.sort not in civitai.IMAGE_SORTS:
+            raise HTTPException(400, f"sort must be one of {list(civitai.IMAGE_SORTS)}")
+        version_ids: List[int] = []
+        if not req.image_ids:
+            info = examples.load_info(path)
+            if req.model_version_id:
+                version_ids = [req.model_version_id]
+            elif info:
+                version_ids = [info["id"]]
+            else:
+                raise HTTPException(400, f"{filename} has no civitai info, so its version is unknown; "
+                                         "pass model_version_id or run a scan first")
+            if req.all_versions:
+                model_id = (info or {}).get("modelId")
+                remote = civitai.get_model_info_by_id(model_id) if model_id else None
+                version_ids += [v["id"] for v in (remote or {}).get("modelVersions") or [] if v.get("id") not in version_ids]
+        params = {"type": req.type, "name": req.name, "image_ids": req.image_ids, "username": req.username,
+                  "version_ids": version_ids, "max_images": req.max_images}
+
+        def run():
+            s = ch_settings.load()
+            skip = req.skip_nsfw
+            if req.image_ids:
+                found = civitai.get_images_by_ids(req.image_ids)
+                images = [found[i] for i in req.image_ids if i in found]
+                missing = [i for i in req.image_ids if i not in found]
+            else:
+                images, videos = _user_images(req.username.strip(), version_ids, req.max_images, req.sort,
+                                              req.period, req.nsfw)
+                missing = []
+            r = examples.add_user_examples(path, images, skip, req.overwrite, s["max_size_preview"])
+            if not req.image_ids:
+                r["skipped_video"] += videos
+            r["not_found"] = missing
+            r["searched_versions"] = version_ids
+            r["message"] = (
+                f"{filename}: {r['added']} added, {r['existed']} already added, {r['in_civitai_list']} already in the "
+                f"civitai example list, {r['skipped_nsfw']} NSFW skipped, {r['skipped_video']} videos skipped, {r['failed']} failed"
+                + (f", {len(missing)} image ids not found" if missing else "")
+                + (", no still images found for that user and model" if not images and not req.image_ids else "")
+            )
+            return r
+
+        task = _submit("add_user_examples", params, run)
+        return _task_response(task, req.wait, req.timeout)
+
+    @router.post("/remove-user-examples", summary="Delete user-added examples (#101+) of one local model")
+    def post_remove_user_examples(req: RemoveUserExamplesRequest):
+        _check_model_type(req.type)
+        _folder, _root, path, _filename = _find_local_model(req.type, req.name)
+        if not (req.image_ids or req.indexes or req.all):
+            raise HTTPException(400, "give image_ids, indexes or all=true")
+        return examples.remove_user_examples(path, req.image_ids, req.indexes, req.all)
 
     @router.get("/model-info", summary="Look up a model on civitai by id or page URL")
     def get_remote_model_info(url_or_id: str = Query(..., description="civitai model id or model page URL")):
