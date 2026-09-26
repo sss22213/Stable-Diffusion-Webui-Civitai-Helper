@@ -7,7 +7,7 @@
 
 * **范例图与卡片信息**（扩展页面中的 "Example Images & Card Info" 区块）：补齐缺失的预览图、把 civitai 上的全部范例图存到模型旁边、把触发词和范例关键词写到 Extra Networks 卡片上。详见[范例图与卡片信息](#范例图与卡片信息)。
 * **用户范例图**：把其他 civitai 用户用某个模型生成的图片（按图片 ID 挑选，或「用户 X 用这个 LoRA 生成的全部图片」）连同关键词存为额外范例，和 civitai 范例放在一起。仅限 HTTP API，详见[范例图与卡片信息](#范例图与卡片信息)。
-* **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描。详见 [HTTP API](#http-api)。
+* **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描，以及连同所有相关文件删除模型。详见 [HTTP API](#http-api)。
 * **Civitai Domain** 设置：可改用 `civitai.red` 之类的镜像站。
 * 下载器修正：改用 wget 支持断点续传，处理相对跳转，模型需要 API Key 时给出明确提示。
 
@@ -34,6 +34,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
   - 🏷: 一键使用这个模型预览图所使用的关键词
 * 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图，并可通过 API 把其他 civitai 用户发布的图片加为额外范例。
 * HTTP API（本分支，见下文），供脚本与助手使用。
+* 用卡片上的 🗑 删除模型时（本分支）会一并删除范例图与卡片信息文件（`模型名.json`），不留下孤立文件；也可通过 API（`/delete-model`）删除。
 
 
 # 安装
@@ -172,6 +173,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 | POST | `/write-card-info` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `overwrite` 与 `set_sd_version` |
 | POST | `/add-user-examples` | 把 civitai 用户发布的图片存为单个模型的额外范例（`模型名.example_101.jpeg`……）：请求体 `{"type", "name"}`，加上 `image_ids`（例如从 civitai 图片搜索挑出的）或 `username`（该用户用这个模型版本生成的图；可选 `all_versions`、`max_images`、`sort`、`period`）；默认包含 NSFW 图片（`nsfw` 为搜索的最高等级，`"None"` 仅 SFW；`skip_nsfw` 可排除 NSFW），视频会被跳过 |
 | POST | `/remove-user-examples` | 请求体 `{"type", "name"}`，加上 `image_ids`、`indexes` 或 `all: true` |
+| POST | `/delete-model` | 请求体 `{"type", "name"}`；永久删除单个模型，与卡片上的 🗑 按钮相同：模型文件、信息文件、预览图、卡片信息（`.json`）与范例图。之后请刷新 WebUI 的模型列表（`POST /sdapi/v1/refresh-loras`） |
 | GET | `/tasks`、`/tasks/{id}?wait=&timeout=` | 最近的任务 / 单个任务 |
 
 所有任务接口都接受请求体中的 `"wait": true` 与 `"timeout": <秒>`。示例：
@@ -193,6 +195,11 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
   -H 'Content-Type: application/json' \
   -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
+
+# 连同所有相关文件删除子目录中的某个 LoRA，然后刷新 WebUI 的 LoRA 列表
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
+  -H 'Content-Type: application/json' -d '{"type": "lora", "name": "characters/Maha-10.safetensors"}'
+curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
 ```
 
 ## 设置

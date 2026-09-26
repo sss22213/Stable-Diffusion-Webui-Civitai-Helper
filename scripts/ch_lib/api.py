@@ -339,6 +339,11 @@ class RemoveUserExamplesRequest(BaseModel):
     all: bool = Field(False, description="Remove every user-added example of this model")
 
 
+class DeleteModelRequest(BaseModel):
+    type: str = Field(..., description="ti | hyper | ckp | lora")
+    name: str = Field(..., description="File name or path relative to the model folder (prefer the relative path: a bare file name may match a model in another subfolder)")
+
+
 class DownloadRequest(TaskOptions):
     url_or_id: str = Field(..., description="civitai model id or model page URL")
     version_id: Optional[int] = Field(None, description="Version id to download (default: newest)")
@@ -588,6 +593,24 @@ def build_router() -> APIRouter:
         if not (req.image_ids or req.indexes or req.all):
             raise HTTPException(400, "give image_ids, indexes or all=true")
         return examples.remove_user_examples(path, req.image_ids, req.indexes, req.all)
+
+    @router.post("/delete-model", summary="Delete one local model and every file that belongs to it")
+    def post_delete_model(req: DeleteModelRequest):
+        """Same as the 🗑 button on the card: the model file, its info files, previews, card
+        metadata (.json) and example images are removed for good. Refresh the WebUI's model
+        list afterwards (e.g. POST /sdapi/v1/refresh-loras)."""
+        _check_model_type(req.type)
+        folder, _root, path, filename = _find_local_model(req.type, req.name)
+        removed, failed = [], []
+        for p in examples.model_files(path):
+            try:
+                os.remove(p)
+                removed.append(util.get_relative_path(p, folder).replace("\\", "/"))
+            except OSError as e:
+                failed.append({"file": util.get_relative_path(p, folder).replace("\\", "/"), "error": str(e)})
+        util.printD(f"delete-model {req.type} {filename}: {len(removed)} files removed, {len(failed)} failed")
+        return {"type": req.type, "name": filename, "removed": removed, "failed": failed,
+                "deleted": not os.path.isfile(path)}
 
     @router.get("/model-info", summary="Look up a model on civitai by id or page URL")
     def get_remote_model_info(url_or_id: str = Query(..., description="civitai model id or model page URL")):

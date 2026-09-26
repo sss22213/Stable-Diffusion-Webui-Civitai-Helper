@@ -319,33 +319,8 @@ def remove_model_by_path(msg):
         util.printD(output)
         return output
     
-    # all files need to be removed
-    related_paths = []
-    related_paths.append(model_path)
-
-
-    # get info file
-    base, ext = os.path.splitext(model_path)
-    info_path = base + model.info_ext
-    first_preview_path = base+".png"
-    sec_preview_path = base+".preview.png"
-    civitai_info_path = base + civitai.suffix + model.info_ext
-
-    if os.path.isfile(civitai_info_path):
-        related_paths.append(civitai_info_path)
-
-    if os.path.isfile(first_preview_path):
-        related_paths.append(first_preview_path)
-
-    if os.path.isfile(sec_preview_path):
-        related_paths.append(sec_preview_path)
-
-    if os.path.isfile(info_path):
-        related_paths.append(info_path)
-
-    # example images saved by "Download Example Images" / the add-user-examples API
-    related_paths.extend(examples.example_files(model_path))
-    related_paths.append(examples.user_sidecar_path(model_path))
+    # all files need to be removed (model, info, previews, card json, example images)
+    related_paths = examples.model_files(model_path)
 
     # remove files
     for rp in related_paths:

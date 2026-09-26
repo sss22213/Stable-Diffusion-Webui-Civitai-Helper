@@ -498,6 +498,25 @@ def download_examples(path: str, max_images: int = 0, skip_nsfw: bool = False,
     return r
 
 
+def model_files(model_path: str) -> list:
+    """Every file that belongs to one model: the model itself, its civitai info file,
+    previews, the old-style info file, the WebUI card metadata (`<model>.json`),
+    downloaded / user-added example images and the user-examples sidecar.
+    Only files that exist; used by the card's delete button and the API."""
+    base, _ = os.path.splitext(model_path)
+    paths = [
+        model_path,
+        base + civitai.suffix + model.info_ext,
+        base + ".png",
+        base + ".preview.png",
+        base + model.info_ext,
+        base + ".json",
+        *example_files(model_path),
+        user_sidecar_path(model_path),
+    ]
+    return [q for q in dict.fromkeys(paths) if os.path.isfile(q)]
+
+
 def remove_examples(path: str) -> int:
     n = 0
     sidecar = user_sidecar_path(path)

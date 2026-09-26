@@ -24,7 +24,7 @@ This fork (sss22213) keeps Civitai Helper 1.x working on **SD WebUI Forge (Class
 
 * **Example images & card info** (tab section "Example Images & Card Info"): restore missing previews, save every civitai example image next to the model, and write trigger words + example prompts onto the Extra Networks cards. See [Example Images & Card Info](#example-images--card-info).
 * **User-posted example images**: save images that other civitai users made with a model (picked by image id, or "everything user X made with this LoRA") as extra examples with their prompts, next to the civitai ones. HTTP API only, see [Download Example Images](#download-example-images).
-* **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models and run scans. See [HTTP API](#http-api).
+* **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models, run scans and delete a model with all its files. See [HTTP API](#http-api).
 * **Civitai Domain** setting for mirrors such as `civitai.red`.
 * Downloader fixes: wget based download with resume, relative redirect handling, clear message when a model needs an API key.
 
@@ -185,6 +185,7 @@ Read-only endpoints answer immediately; long-running work runs on one background
 | POST | `/write-card-info` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `overwrite` and `set_sd_version` |
 | POST | `/add-user-examples` | save images that civitai users posted as extra examples of one model (`model_file.example_101.jpeg`, …): body `{"type", "name"}` plus either `image_ids` (e.g. picked from a civitai image search) or `username` (that user's images made with this model's version; `all_versions`, `max_images`, `sort`, `period`); NSFW images are included by default (`nsfw` = highest level to search, `"None"` for SFW only; `skip_nsfw` drops NSFW images), videos are skipped |
 | POST | `/remove-user-examples` | body `{"type", "name"}` plus `image_ids`, `indexes` or `all: true` |
+| POST | `/delete-model` | body `{"type", "name"}`; delete one model for good, like the 🗑 button: the model file, its info files, previews, card metadata (`.json`) and example images. Refresh the WebUI's list afterwards (`POST /sdapi/v1/refresh-loras`) |
 | GET | `/tasks`, `/tasks/{id}?wait=&timeout=` | recent tasks / one task |
 
 All task endpoints accept `"wait": true` and `"timeout": <seconds>` in the body. Example:
@@ -206,6 +207,11 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
   -H 'Content-Type: application/json' \
   -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
+
+# delete a LoRA in a subfolder with all its files, then refresh the WebUI's LoRA list
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
+  -H 'Content-Type: application/json' -d '{"type": "lora", "name": "characters/Maha-10.safetensors"}'
+curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
 ```
 
 ## Settings
@@ -331,6 +337,10 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.14.0 (this fork)
+* HTTP API `/delete-model`: delete one local model for good, like the 🗑 button on the card. Returns the files that were removed (and any that could not be). Pass the path relative to the model folder for models in subfolders.
+* Deleting a model with 🗑 also removes the WebUI card metadata file (`model_file.json`: description, activation text, preferred weight, notes), so no orphaned file is left behind.
+
 ## v1.13.0 (this fork)
 * HTTP API `/add-user-examples`: save images that civitai users posted (by image id, or a user's images made with this model's version) as extra examples #101+, with their prompts, parameters, LoRAs used and author in `model_file.examples.json`. `/remove-user-examples` deletes them.
 * `/models/{type}/examples` lists these user examples, and "Write Example Prompt to Cards" adds their prompts to the card notes.
