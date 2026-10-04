@@ -24,7 +24,7 @@ This fork (sss22213) keeps Civitai Helper 1.x working on **SD WebUI Forge (Class
 
 * **Example images & card info** (tab section "Example Images & Card Info"): restore missing previews, save every civitai example image next to the model, and write trigger words + example prompts onto the Extra Networks cards. See [Example Images & Card Info](#example-images--card-info).
 * **User-posted example images**: save images that other civitai users made with a model (picked by image id, or "everything user X made with this LoRA") as extra examples with their prompts, next to the civitai ones. HTTP API only, see [Download Example Images](#download-example-images).
-* **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models, run scans and delete a model with all its files. See [HTTP API](#http-api).
+* **HTTP API** at `/civitai-helper/v1` so other tools (chat assistants, scripts) can list installed models with trigger words, look up / download civitai models, run scans, and rename or delete a model with all its files. See [HTTP API](#http-api).
 * **Civitai Domain** setting for mirrors such as `civitai.red`.
 * Downloader fixes: wget based download with resume, relative redirect handling, clear message when a model needs an API key.
 
@@ -186,6 +186,7 @@ Read-only endpoints answer immediately; long-running work runs on one background
 | POST | `/add-user-examples` | save images that civitai users posted as extra examples of one model (`model_file.example_101.jpeg`, …): body `{"type", "name"}` plus either `image_ids` (e.g. picked from a civitai image search) or `username` (that user's images made with this model's version; `all_versions`, `max_images`, `sort`, `period`); NSFW images are included by default (`nsfw` = highest level to search, `"None"` for SFW only; `skip_nsfw` drops NSFW images), videos are skipped |
 | POST | `/remove-user-examples` | body `{"type", "name"}` plus `image_ids`, `indexes` or `all: true` |
 | POST | `/delete-model` | body `{"type", "name"}`; delete one model for good, like the 🗑 button: the model file, its info files, previews, card metadata (`.json`) and example images. Refresh the WebUI's list afterwards (`POST /sdapi/v1/refresh-loras`) |
+| POST | `/rename-model` | body `{"type", "name", "new_name"}`; rename one model together with its info files, previews, card metadata (`.json`) and example images, inside the same folder. Without an extension `new_name` keeps the current one; ending it in `.safetensors`, `.ckpt`, `.pt` or `.bin` changes the model file's extension too (the file is not converted, and `warnings` reports a format mismatch or an extension the WebUI does not list). Nothing is renamed if a target file already exists, if another model of the same type already has that name, or if the name contains `/ \ : * ? " < > \|`; a failure half way is rolled back. The response lists every renamed file, the new `prompt_tag`, the LoRA's embedded `alias` if it has one, and the core endpoint to call next in `refresh` |
 | GET | `/tasks`, `/tasks/{id}?wait=&timeout=` | recent tasks / one task |
 
 All task endpoints accept `"wait": true` and `"timeout": <seconds>` in the body. Example:
@@ -212,6 +213,22 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
   -H 'Content-Type: application/json' -d '{"type": "lora", "name": "characters/Maha-10.safetensors"}'
 curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
+
+# rename a LoRA with all its files, then refresh the WebUI's LoRA list
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "lora", "name": "characters/Maha-10.safetensors", "new_name": "maha_v10"}'
+curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
+```
+
+After renaming a LoRA, prompts, styles and presets that use the old `<lora:old_name:...>` tag must be updated. If the LoRA has an alias stored inside the file (`ss_output_name`) and the WebUI setting "When adding to prompt, refer to Lora by" is "Alias from file" (the default), its card keeps inserting the alias; both the alias and the new file name work.
+
+Changing the extension only renames the file; it does not convert it. A safetensors file renamed to `.ckpt` or `.pt`, or a PyTorch file renamed to `.safetensors`, fails to load, and the API warns about it. Use it to fix a file that was saved with the wrong extension.
+
+```bash
+# fix a LoRA that is a safetensors file but was saved with a .ckpt extension
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
+  -H 'Content-Type: application/json' -d '{"type": "lora", "name": "old_style.ckpt", "new_name": "old_style.safetensors"}'
 ```
 
 ## Settings
@@ -337,6 +354,9 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.15.0 (this fork)
+* HTTP API `/rename-model`: rename one local model together with every file that belongs to it (info files, previews in any format, card metadata, example images, user-examples sidecar). Refuses names that would clash with an existing file or another model of the same type, or break the `<lora:name:weight>` prompt syntax, and rolls back if a rename fails half way. The response gives the new prompt tag, the LoRA's embedded alias and the WebUI endpoint to refresh. `new_name` may also change the model file's extension (`.safetensors`, `.ckpt`, `.pt`, `.bin`); the file is not converted, and a format mismatch or an extension the WebUI does not list is reported in `warnings`.
+
 ## v1.14.0 (this fork)
 * HTTP API `/delete-model`: delete one local model for good, like the 🗑 button on the card. Returns the files that were removed (and any that could not be). Pass the path relative to the model folder for models in subfolders.
 * Deleting a model with 🗑 also removes the WebUI card metadata file (`model_file.json`: description, activation text, preferred weight, notes), so no orphaned file is left behind.

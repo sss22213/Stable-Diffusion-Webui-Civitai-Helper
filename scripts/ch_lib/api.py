@@ -21,11 +21,17 @@ POST /add-user-examples saves images that civitai users posted (by image id,
 or "everything user X made with this model") as extra examples #101+ of one
 model; POST /remove-user-examples deletes them again.
 
+POST /rename-model and POST /delete-model rename or delete one local model
+together with every file that belongs to it (info, previews, card metadata,
+example images).
+
 If the WebUI was started with --api-auth, the same basic-auth credentials
 are required for every route here.
 """
 import os
 import re
+import errno
+import struct
 import time
 import uuid
 import queue
@@ -344,6 +350,12 @@ class DeleteModelRequest(BaseModel):
     name: str = Field(..., description="File name or path relative to the model folder (prefer the relative path: a bare file name may match a model in another subfolder)")
 
 
+class RenameModelRequest(BaseModel):
+    type: str = Field(..., description="ti | hyper | ckp | lora")
+    name: str = Field(..., description="Current file name or path relative to the model folder (prefer the relative path: a bare file name may match a model in another subfolder)")
+    new_name: str = Field(..., description="New file name. Without an extension (e.g. 'my_style') the current extension is kept; with one of .safetensors / .ckpt / .pt / .bin (e.g. 'my_style.ckpt') the extension changes too. The model stays in its folder. Changing the extension does not convert the file")
+
+
 class DownloadRequest(TaskOptions):
     url_or_id: str = Field(..., description="civitai model id or model page URL")
     version_id: Optional[int] = Field(None, description="Version id to download (default: newest)")
@@ -373,6 +385,137 @@ def _user_images(username: str, version_ids: List[int], max_images: int, sort, p
             if len(out) >= max_images:
                 return out, videos
     return out, videos
+
+
+# ---------------------------------------------------------------------------
+# Rename
+# ---------------------------------------------------------------------------
+
+# ':' '<' '>' would break the <lora:name:weight> prompt syntax; the rest are
+# path separators or characters Windows does not allow in file names.
+_BAD_NAME_CHARS = set('/\\:*?"<>|')
+
+# WebUI core endpoint that makes the WebUI pick up a renamed model.
+_REFRESH_ENDPOINTS = {
+    "lora": "POST /sdapi/v1/refresh-loras",
+    "ckp": "POST /sdapi/v1/refresh-checkpoints",
+    "ti": "POST /sdapi/v1/refresh-embeddings",
+}
+
+
+# Extensions the WebUI lists for each model type (Forge Neo); others are skipped by the WebUI.
+_WEBUI_EXTS = {
+    "lora": (".safetensors", ".ckpt", ".pt"),
+    "ckp": (".safetensors", ".ckpt"),
+    "ti": (".safetensors", ".pt", ".bin"),
+    "hyper": (".pt",),
+}
+
+
+def _new_file_name(path: str, new_name: str):
+    """Validate `new_name` for the model at `path`; return (new stem, new extension)."""
+    raw = (new_name or "").strip()
+    old_stem, old_ext = os.path.splitext(os.path.basename(path))
+    stem, ext = os.path.splitext(raw)
+    if ext.lower() in model.exts:
+        if ext.lower() == old_ext.lower():
+            ext = old_ext   # same extension in another letter case: keep the file's own spelling
+    else:
+        # e.g. "style_v1.5": ".5" is part of the name, not an extension
+        stem, ext = raw, old_ext
+    if not stem:
+        raise HTTPException(400, "new_name is required")
+    if any(c in _BAD_NAME_CHARS or ord(c) < 32 for c in stem):
+        raise HTTPException(400, "new_name may not contain / \\ : * ? \" < > | or control characters; "
+                                 "the model is renamed inside its own folder")
+    if stem != stem.strip() or stem.startswith(".") or stem.endswith("."):
+        raise HTTPException(400, "new_name may not start or end with a space or a dot")
+    if stem.lower().endswith(model.vae_suffix):
+        raise HTTPException(400, f"names ending in {model.vae_suffix} are treated as VAE files and hidden from the model list")
+    if stem == old_stem and ext == old_ext:
+        raise HTTPException(400, "new_name is the same as the current name")
+    return stem, ext
+
+
+def _detect_format(path: str) -> Optional[str]:
+    """'safetensors' or 'pytorch' judged from the file's first bytes; None when unknown."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    if len(head) >= 9:
+        n = struct.unpack("<Q", head[:8])[0]
+        if 0 < n <= local_models.MAX_SAFETENSORS_HEADER and head[8:9] == b"{":
+            return "safetensors"
+    if head.startswith(b"PK\x03\x04") or head[:1] == b"\x80":   # torch zip archive / legacy pickle
+        return "pytorch"
+    return None
+
+
+def _rename_plan(model_type: str, folder: str, path: str, new_stem: str, new_ext: str) -> list:
+    """[(src, dst), ...] for the model and every file that belongs to it; the model file comes last.
+    Companion files (info, previews, card, examples) keep their own suffixes and only move when the
+    stem changes; the model file also takes the new extension."""
+    rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/")
+    directory = os.path.dirname(path)
+    old_stem, ext = os.path.splitext(os.path.basename(path))
+    base = os.path.join(directory, old_stem)
+
+    # another model file with the same stem shares every companion file, so they cannot be told apart
+    twins = [old_stem + e for e in model.exts if e.lower() != ext.lower() and os.path.isfile(base + e)]
+    if twins:
+        raise HTTPException(409, f"{rel(path)} shares its info, preview and example files with {twins} in the same "
+                                 "folder; rename or remove that file first")
+
+    # LoRAs, embeddings and hypernetworks are looked up by file name alone, so a duplicate would hide one of them
+    if model_type != "ckp" and new_stem != old_stem:
+        for _f, _r, other, filename in local_models.iter_models(model_type):
+            if os.path.splitext(filename)[0] == new_stem and os.path.abspath(other) != os.path.abspath(path):
+                raise HTTPException(409, f"another {model_type} model is already named '{new_stem}': {rel(other)}; "
+                                         "the WebUI looks these models up by file name, so one would hide the other")
+
+    candidates = examples.model_files(path) + [base + s for s in local_models.PREVIEW_SUFFIXES]
+    companions = [q for q in dict.fromkeys(candidates) if q != path and os.path.isfile(q)]
+    pairs = [(q, new_stem + os.path.basename(q)[len(old_stem):]) for q in companions
+             if new_stem != old_stem and os.path.basename(q).startswith(old_stem)]
+    pairs.append((path, new_stem + new_ext))
+    plan, conflicts = [], []
+    for src, dst_name in pairs:
+        if len(dst_name.encode("utf-8")) > 255:
+            raise HTTPException(400, f"new_name is too long: '{dst_name}' exceeds the 255-byte file name limit")
+        dst = os.path.join(directory, dst_name)
+        if os.path.lexists(dst) and not os.path.samefile(src, dst):
+            conflicts.append(rel(dst))
+        plan.append((src, dst))
+    if conflicts:
+        raise HTTPException(409, f"these files already exist, nothing was renamed: {conflicts}")
+    return plan
+
+
+def _apply_renames(plan: list, folder: str):
+    """Rename every (src, dst) pair; on any failure undo the renames already done and raise HTTP 500."""
+    rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/")
+    done = []
+    for src, dst in plan:
+        try:
+            if os.path.lexists(dst) and not os.path.samefile(src, dst):
+                raise FileExistsError(errno.EEXIST, "file appeared while renaming", dst)
+            os.rename(src, dst)
+            done.append((src, dst))
+        except OSError as e:
+            rollback_failed = []
+            for s_back, d_back in reversed(done):
+                try:
+                    os.rename(d_back, s_back)
+                except OSError as e2:
+                    rollback_failed.append({"file": rel(d_back), "error": str(e2)})
+            util.printD(f"rename-model: {rel(src)} failed ({e}); rolled back {len(done) - len(rollback_failed)} of {len(done)}")
+            raise HTTPException(500, {
+                "error": f"renaming {rel(src)} failed: {e}",
+                "rolled_back": not rollback_failed,
+                "rollback_failed": rollback_failed,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +754,69 @@ def build_router() -> APIRouter:
         util.printD(f"delete-model {req.type} {filename}: {len(removed)} files removed, {len(failed)} failed")
         return {"type": req.type, "name": filename, "removed": removed, "failed": failed,
                 "deleted": not os.path.isfile(path)}
+
+    @router.post("/rename-model", summary="Rename one local model together with every file that belongs to it")
+    def post_rename_model(req: RenameModelRequest):
+        """Renames the model file and its info files, previews, card metadata (.json),
+        example images and user-examples sidecar inside the model's own folder. `new_name` may
+        also change the model file's extension (the file is not converted; a format mismatch is
+        reported in `warnings`). Nothing is
+        renamed when a target file already exists, and a failure half way is rolled back.
+        The WebUI only sees the new name after its list is refreshed: call the endpoint in
+        `refresh` (e.g. POST /sdapi/v1/refresh-loras). Prompts that used the old name must be
+        updated by hand."""
+        _check_model_type(req.type)
+        folder, _root, path, filename = _find_local_model(req.type, req.name)
+        old_stem, old_ext = os.path.splitext(filename)
+        new_stem, new_ext = _new_file_name(path, req.new_name)
+        plan = _rename_plan(req.type, folder, path, new_stem, new_ext)
+        _apply_renames(plan, folder)
+        local_models._meta_cache.pop(path, None)
+
+        rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/")
+        new_path = plan[-1][1]
+        new_entry = local_models.entry(req.type, folder, os.path.dirname(new_path), new_path,
+                                       os.path.basename(new_path))
+        warnings = []
+        result = {
+            "type": req.type,
+            "old_name": rel(path),
+            "new_name": rel(new_path),
+            "renamed": [{"from": rel(s), "to": rel(d)} for s, d in plan],
+            "prompt_tag": new_entry.get("prompt_tag"),
+            "refresh": _REFRESH_ENDPOINTS.get(req.type),
+            "warnings": warnings,
+        }
+        if new_ext.lower() != old_ext.lower():
+            fmt = _detect_format(new_path)
+            if new_ext.lower() == ".safetensors" and fmt == "pytorch":
+                warnings.append(f"The file content is a PyTorch pickle, not safetensors. Renaming does not convert it, "
+                                f"so the WebUI will fail to load it as {new_ext}; rename it back to {old_ext}.")
+            elif new_ext.lower() != ".safetensors" and fmt == "safetensors":
+                warnings.append(f"The file content is safetensors. Renaming does not convert it, so the WebUI will "
+                                f"fail to load it as {new_ext}; rename it back to .safetensors.")
+            if new_ext.lower() not in _WEBUI_EXTS.get(req.type, ()):
+                warnings.append(f"The WebUI does not list {req.type} models ending in {new_ext} "
+                                f"(it uses {', '.join(_WEBUI_EXTS.get(req.type, ()))}), so this model will not appear there.")
+        if req.type == "lora" and new_stem != old_stem:
+            alias = local_models.read_safetensors_metadata(new_path).get("ss_output_name")
+            if alias and alias != new_stem:
+                result["alias"] = alias
+                if getattr(shared.opts, "lora_preferred_name", "Alias from file") != "Filename":
+                    warnings.append(
+                        f"This LoRA has the alias '{alias}' stored inside the file. The WebUI setting "
+                        f"'When adding to prompt, refer to Lora by' is 'Alias from file', so its card still inserts "
+                        f"<lora:{alias}:1>. After the refresh both <lora:{new_stem}:...> and <lora:{alias}:...> work."
+                    )
+            if alias != old_stem:
+                warnings.append(f"Prompts, styles and presets that use <lora:{old_stem}:...> no longer find this "
+                                f"LoRA; change them to <lora:{new_stem}:...>.")
+        elif req.type in ("ti", "hyper") and new_stem != old_stem:
+            warnings.append(f"Prompts that use the old name '{old_stem}' must be changed to '{new_stem}'.")
+        if not result["refresh"]:
+            warnings.append("Refresh the model list in the WebUI to see the new name.")
+        util.printD(f"rename-model {req.type} {rel(path)} -> {rel(new_path)}: {len(plan)} files")
+        return result
 
     @router.get("/model-info", summary="Look up a model on civitai by id or page URL")
     def get_remote_model_info(url_or_id: str = Query(..., description="civitai model id or model page URL")):

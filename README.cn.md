@@ -7,7 +7,7 @@
 
 * **范例图与卡片信息**（扩展页面中的 "Example Images & Card Info" 区块）：补齐缺失的预览图、把 civitai 上的全部范例图存到模型旁边、把触发词和范例关键词写到 Extra Networks 卡片上。详见[范例图与卡片信息](#范例图与卡片信息)。
 * **用户范例图**：把其他 civitai 用户用某个模型生成的图片（按图片 ID 挑选，或「用户 X 用这个 LoRA 生成的全部图片」）连同关键词存为额外范例，和 civitai 范例放在一起。仅限 HTTP API，详见[范例图与卡片信息](#范例图与卡片信息)。
-* **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描，以及连同所有相关文件删除模型。详见 [HTTP API](#http-api)。
+* **HTTP API**：位于 `/civitai-helper/v1`，让其他工具（聊天助手、脚本）可以列出已安装模型与触发词、查询 / 下载 civitai 模型、执行扫描，以及连同所有相关文件重命名或删除模型。详见 [HTTP API](#http-api)。
 * **Civitai Domain** 设置：可改用 `civitai.red` 之类的镜像站。
 * 下载器修正：改用 wget 支持断点续传，处理相对跳转，模型需要 API Key 时给出明确提示。
 
@@ -35,6 +35,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 * 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图，并可通过 API 把其他 civitai 用户发布的图片加为额外范例。
 * HTTP API（本分支，见下文），供脚本与助手使用。
 * 用卡片上的 🗑 删除模型时（本分支）会一并删除范例图与卡片信息文件（`模型名.json`），不留下孤立文件；也可通过 API（`/delete-model`）删除。
+* 可通过 API（`/rename-model`，本分支）重命名模型，模型文件与信息文件、预览图、卡片信息和范例图会一起改名。
 
 
 # 安装
@@ -174,6 +175,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 | POST | `/add-user-examples` | 把 civitai 用户发布的图片存为单个模型的额外范例（`模型名.example_101.jpeg`……）：请求体 `{"type", "name"}`，加上 `image_ids`（例如从 civitai 图片搜索挑出的）或 `username`（该用户用这个模型版本生成的图；可选 `all_versions`、`max_images`、`sort`、`period`）；默认包含 NSFW 图片（`nsfw` 为搜索的最高等级，`"None"` 仅 SFW；`skip_nsfw` 可排除 NSFW），视频会被跳过 |
 | POST | `/remove-user-examples` | 请求体 `{"type", "name"}`，加上 `image_ids`、`indexes` 或 `all: true` |
 | POST | `/delete-model` | 请求体 `{"type", "name"}`；永久删除单个模型，与卡片上的 🗑 按钮相同：模型文件、信息文件、预览图、卡片信息（`.json`）与范例图。之后请刷新 WebUI 的模型列表（`POST /sdapi/v1/refresh-loras`） |
+| POST | `/rename-model` | 请求体 `{"type", "name", "new_name"}`；在原目录内重命名单个模型，连同信息文件、预览图、卡片信息（`.json`）与范例图一起改名。`new_name` 不带扩展名时保留原扩展名；以 `.safetensors`、`.ckpt`、`.pt` 或 `.bin` 结尾时，模型文件的扩展名也会一并更改（不会转换文件格式，格式不符或 WebUI 不会列出该扩展名时会在 `warnings` 中提示）。目标文件已存在、同类型已有同名模型，或名称含有 `/ \ : * ? " < > \|` 时不会改动任何文件；中途失败会全部还原。返回所有改名的文件、新的 `prompt_tag`、LoRA 内嵌的别名 `alias`（如有），以及接下来要调用的刷新接口 `refresh` |
 | GET | `/tasks`、`/tasks/{id}?wait=&timeout=` | 最近的任务 / 单个任务 |
 
 所有任务接口都接受请求体中的 `"wait": true` 与 `"timeout": <秒>`。示例：
@@ -200,6 +202,22 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
   -H 'Content-Type: application/json' -d '{"type": "lora", "name": "characters/Maha-10.safetensors"}'
 curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
+
+# 连同所有相关文件重命名某个 LoRA，然后刷新 WebUI 的 LoRA 列表
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "lora", "name": "characters/Maha-10.safetensors", "new_name": "maha_v10"}'
+curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
+```
+
+重命名 LoRA 后，使用旧名称 `<lora:旧名称:...>` 的关键词、样式与预设需要手动更新。若 LoRA 文件内嵌了别名（`ss_output_name`），且 WebUI 设置 "When adding to prompt, refer to Lora by" 为 "Alias from file"（默认值），卡片仍会插入别名；别名与新文件名都能使用。
+
+更改扩展名只是改文件名，不会转换文件格式。safetensors 文件改成 `.ckpt` 或 `.pt`，或 PyTorch 文件改成 `.safetensors`，都会载入失败，API 会给出警告。此功能适合修正扩展名存错的文件。
+
+```bash
+# 某个 LoRA 实际是 safetensors 文件却被存成 .ckpt，把扩展名改正
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
+  -H 'Content-Type: application/json' -d '{"type": "lora", "name": "old_style.ckpt", "new_name": "old_style.safetensors"}'
 ```
 
 ## 设置
