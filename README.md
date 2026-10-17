@@ -177,6 +177,8 @@ Read-only endpoints answer immediately; long-running work runs on one background
 | GET | `/models/{type}/info?name=&full=` | stored civitai info of one model (`full=true` adds the raw info file and safetensors metadata) |
 | GET | `/models/{type}/examples?name=` | example images of one model with prompt, negative prompt, steps, sampler, CFG, seed, checkpoint, NSFW flag, civitai URL and the local file / URL when downloaded |
 | GET | `/model-info?url_or_id=` | look up a civitai model by id or page URL: versions (newest first), trigger words, files, target folder and subfolders |
+| GET | `/civitai/models?query=&types=&base_model=&limit=&sort=&period=&username=&tag=&nsfw=&cursor=` | search civitai for models; answers civitai's own JSON plus `_query`. `base_model` (repeatable) understands short forms such as `illu`, `sd1.5`, `pony`, `flux`, and when civitai's text search combined with a base model finds too little, the text alone is searched too and filtered by base model |
+| GET | `/civitai/images?username=&model=&model_version_id=&sort=&period=&nsfw=&limit=&cursor=` | search the images people posted on civitai, with their generation data: by user, by model (id or page URL, `?modelVersionId=` narrows to a version), or both; `nsfw` = highest level (`None`, `Soft`, `Mature`, `X`) |
 | POST | `/scan` | body `{"model_types": ["lora"]}`; fetch missing info files and previews (SHA256 match) |
 | POST | `/download` | body `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`; download a version with info file and preview |
 | POST | `/check-new-version` | body `{"model_types": [...]}`; installed models that have a newer version |
@@ -229,6 +231,18 @@ Changing the extension only renames the file; it does not convert it. A safetens
 # fix a LoRA that is a safetensors file but was saved with a .ckpt extension
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
   -H 'Content-Type: application/json' -d '{"type": "lora", "name": "old_style.ckpt", "new_name": "old_style.safetensors"}'
+```
+
+## MCP server
+Everything the HTTP API can do is also offered as a [Model Context Protocol](https://modelcontextprotocol.io) server at `/civitai-helper/mcp` (Streamable HTTP), so AI agents such as Claude Code, Claude Desktop or Codex can manage your models directly. Tools: `civitai_lora_inventory`, `civitai_list_local_models`, `civitai_local_model_info`, `civitai_model_examples`, `civitai_lookup_model`, `civitai_download_model`, `civitai_scan_models`, `civitai_check_new_versions`, `civitai_fetch_previews`, `civitai_download_examples`, `civitai_add_user_examples`, `civitai_remove_user_examples`, `civitai_write_card_info`, `civitai_rename_model`, `civitai_delete_model`, `civitai_model_types`, `civitai_task_status`, `civitai_search_models`, `civitai_search_images`.
+
+* Each tool calls the matching `/civitai-helper/v1` route in-process, so the results are the same as the HTTP API. Long-running tools (scan, download, previews, examples, card info) wait for the task by default and send progress notifications while it runs.
+* Clients send `Authorization: Bearer <token>` (or `X-MCP-Token`, or `?token=`). The token is generated on first start and shown under Settings -> Civitai Helper, where the server can also be turned off; the environment variable `CIVITAI_HELPER_MCP_TOKEN` overrides it.
+* No new dependencies (the protocol is implemented in `scripts/ch_lib/mcp_server.py`).
+
+```bash
+# Claude Code
+claude mcp add --transport http civitai-helper http://127.0.0.1:7860/civitai-helper/mcp --header "Authorization: Bearer <token>"
 ```
 
 ## Settings
@@ -354,6 +368,10 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.16.0 (this fork)
+* MCP server at `/civitai-helper/mcp`: every HTTP API feature as Model Context Protocol tools for AI agents (Claude Code / Desktop, Codex ...), with a bearer token (Settings -> Civitai Helper) and progress notifications for long tasks.
+* HTTP API `/civitai/models` and `/civitai/images` (MCP tools `civitai_search_models`, `civitai_search_images`): search civitai for models (base-model short forms, text-search fallback) and for the images people posted with their generation data. They use the domain, API key and proxy from Settings.
+
 ## v1.15.0 (this fork)
 * HTTP API `/rename-model`: rename one local model together with every file that belongs to it (info files, previews in any format, card metadata, example images, user-examples sidecar). Refuses names that would clash with an existing file or another model of the same type, or break the `<lora:name:weight>` prompt syntax, and rolls back if a rename fails half way. The response gives the new prompt tag, the LoRA's embedded alias and the WebUI endpoint to refresh. `new_name` may also change the model file's extension (`.safetensors`, `.ckpt`, `.pt`, `.bin`); the file is not converted, and a format mismatch or an extension the WebUI does not list is reported in `warnings`.
 

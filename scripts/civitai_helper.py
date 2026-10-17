@@ -42,6 +42,9 @@ model.get_custom_model_folder()
 # All settings now must be saved from setting page.
 def on_ui_settings():
     ch_section = ("civitai_helper", "Civitai Helper")
+    # MCP token: generate it before the Settings page is built so it shows there
+    from scripts.ch_lib import mcp_tools
+    mcp_tools.ensure_token()
     # settings
     shared.opts.add_option("ch_max_size_preview", shared.OptionInfo(True, "Download Max Size Preview", gr.Checkbox, {"interactive": True}, section=ch_section))
     shared.opts.add_option("ch_skip_nsfw_preview", shared.OptionInfo(False, "Skip NSFW Preview Images", gr.Checkbox, {"interactive": True}, section=ch_section))
@@ -50,6 +53,8 @@ def on_ui_settings():
     shared.opts.add_option("ch_proxy", shared.OptionInfo("", "Civitai Helper Proxy", gr.Textbox, {"interactive": True, "lines":1, "info":"format: socks5h://127.0.0.1:port"}, section=ch_section))
     shared.opts.add_option("ch_civiai_api_key", shared.OptionInfo("", "Civitai API Key", gr.Textbox, {"interactive": True, "lines":1, "info":"check doc:https://github.com/zixaphir/Stable-Diffusion-Webui-Civitai-Helper/tree/master#api-key"}, section=ch_section))
     shared.opts.add_option("ch_civitai_domain", shared.OptionInfo(civitai.DEFAULT_DOMAIN, "Civitai Domain", gr.Textbox, {"interactive": True, "lines": 1, "info": "Hostname of the civitai instance to call. Default civitai.com; mirrors like civitai.red use the same /api/v1 paths."}, section=ch_section))
+    shared.opts.add_option("ch_mcp_enable", shared.OptionInfo(True, "Serve the MCP endpoint /civitai-helper/mcp (Model Context Protocol, for AI agents)", gr.Checkbox, {"interactive": True}, section=ch_section))
+    shared.opts.add_option("ch_mcp_token", shared.OptionInfo("", "MCP access token", gr.Textbox, {"interactive": True, "lines": 1, "info": "Clients send Authorization: Bearer <token>. Generated at startup when empty; the env var CIVITAI_HELPER_MCP_TOKEN overrides it."}, section=ch_section))
 
 def on_ui_tabs():
     # init

@@ -25,6 +25,10 @@ POST /rename-model and POST /delete-model rename or delete one local model
 together with every file that belongs to it (info, previews, card metadata,
 example images).
 
+GET /civitai/models and GET /civitai/images search civitai itself (models;
+images people posted, with their generation data) and answer civitai's JSON
+(see ch_lib/civitai_search.py).
+
 If the WebUI was started with --api-auth, the same basic-auth credentials
 are required for every route here.
 """
@@ -50,6 +54,7 @@ from modules import shared
 from . import util
 from . import model
 from . import civitai
+from . import civitai_search
 from . import ch_settings
 from . import local_models
 from . import examples
@@ -843,6 +848,45 @@ def build_router() -> APIRouter:
             "versions": [_version_view(v) for v in info["modelVersions"]],
         }
 
+    @router.get("/civitai/models", summary="Search models on civitai (civitai's JSON plus _query)")
+    def get_civitai_models(
+        query: Optional[str] = Query(None, description="search text"),
+        types: Optional[str] = Query(None, description="LORA, Checkpoint, TextualInversion, LoCon, DoRA, ..."),
+        base_model: Optional[List[str]] = Query(None, description="base models; short forms like illu, sd1.5, pony work"),
+        limit: int = Query(6, ge=1, le=100),
+        sort: Optional[str] = Query(None, description="Highest Rated | Most Downloaded | Newest"),
+        period: Optional[str] = Query(None, description="AllTime | Year | Month | Week | Day"),
+        username: Optional[str] = None,
+        tag: Optional[str] = None,
+        nsfw: Optional[bool] = None,
+        cursor: Optional[str] = None,
+    ):
+        ch_settings.load()
+        try:
+            return civitai_search.search_models(query, types, base_model, limit, sort, period, username, tag,
+                                                nsfw, cursor)
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+
+    @router.get("/civitai/images", summary="Search images posted on civitai, with their generation data")
+    def get_civitai_images(
+        username: Optional[str] = Query(None, description="civitai user who posted them"),
+        model: Optional[str] = Query(None, description="civitai model id or model page URL (?modelVersionId= narrows to a version)"),
+        model_version_id: Optional[int] = None,
+        sort: Optional[str] = Query(None, description="Most Reactions | Most Comments | Most Collected | Newest | Oldest"),
+        period: Optional[str] = Query(None, description="AllTime | Year | Month | Week | Day"),
+        nsfw: Optional[str] = Query(None, description="highest NSFW level: None | Soft | Mature | X"),
+        limit: int = Query(12, ge=1, le=200),
+        cursor: Optional[str] = None,
+    ):
+        ch_settings.load()
+        try:
+            return civitai_search.search_images(username, model, model_version_id, sort, period, nsfw, limit, cursor)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+
     @router.post("/scan", summary="Scan local models: fetch missing civitai info files and previews")
     def post_scan(req: ScanRequest):
         types = _normalize_types(req.model_types)
@@ -960,4 +1004,13 @@ def on_app_started(demo, app: FastAPI):
         util.printD(f"API mounted at {PREFIX} (see /docs)")
     except Exception as e:
         util.printD(f"Failed to mount API: {e}")
+        traceback.print_exc()
+    # The same features as MCP tools for AI agents (ch_lib/mcp_tools.py)
+    try:
+        from . import mcp_tools
+
+        server = mcp_tools.mount(app, log=util.printD)
+        util.printD(f"MCP server at {mcp_tools.MCP_PATH} ({len(server.tools)} tools); token in Settings -> Civitai Helper")
+    except Exception as e:
+        util.printD(f"Failed to mount the MCP server: {e}")
         traceback.print_exc()

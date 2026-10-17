@@ -166,6 +166,8 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 | GET | `/models/{type}/info?name=&full=` | 单个模型保存的 civitai 信息（`full=true` 附带原始信息文件与 safetensors 元数据） |
 | GET | `/models/{type}/examples?name=` | 单个模型的范例图：关键词、负面关键词、步数、采样器、CFG、种子、大模型、NSFW 标记、civitai 网址，以及已下载时的本地文件 / 网址 |
 | GET | `/model-info?url_or_id=` | 用 id 或页面网址查询 civitai 模型：版本（最新在前）、触发词、文件、目标目录及子目录 |
+| GET | `/civitai/models?query=&types=&base_model=&limit=&sort=&period=&username=&tag=&nsfw=&cursor=` | 在 civitai 搜索模型，回传 civitai 原始 JSON 加上 `_query`。`base_model`（可重复）认得 `illu`、`sd1.5`、`pony`、`flux` 等简写；文字搜索配合底模找到太少时，会再单用文字搜索并按底模过滤 |
+| GET | `/civitai/images?username=&model=&model_version_id=&sort=&period=&nsfw=&limit=&cursor=` | 搜索用户在 civitai 发布的图片（含生成参数）：按用户、按模型（id 或页面网址，`?modelVersionId=` 限定版本）或两者；`nsfw` 为最高等级（`None`、`Soft`、`Mature`、`X`） |
 | POST | `/scan` | 请求体 `{"model_types": ["lora"]}`；补齐缺失的信息文件与预览图（SHA256 匹配） |
 | POST | `/download` | 请求体 `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`；下载版本并保存信息文件与预览图 |
 | POST | `/check-new-version` | 请求体 `{"model_types": [...]}`；列出有新版本的本地模型 |
@@ -218,6 +220,18 @@ curl -X POST http://127.0.0.1:7860/sdapi/v1/refresh-loras
 # 某个 LoRA 实际是 safetensors 文件却被存成 .ckpt，把扩展名改正
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
   -H 'Content-Type: application/json' -d '{"type": "lora", "name": "old_style.ckpt", "new_name": "old_style.safetensors"}'
+```
+
+## MCP 服务器
+HTTP API 能做的事，也以 [Model Context Protocol](https://modelcontextprotocol.io) 服务器的形式提供在 `/civitai-helper/mcp`（Streamable HTTP），Claude Code、Claude Desktop、Codex 等 AI 代理可以直接管理你的模型。工具：`civitai_lora_inventory`、`civitai_list_local_models`、`civitai_local_model_info`、`civitai_model_examples`、`civitai_lookup_model`、`civitai_download_model`、`civitai_scan_models`、`civitai_check_new_versions`、`civitai_fetch_previews`、`civitai_download_examples`、`civitai_add_user_examples`、`civitai_remove_user_examples`、`civitai_write_card_info`、`civitai_rename_model`、`civitai_delete_model`、`civitai_model_types`、`civitai_task_status`、`civitai_search_models`、`civitai_search_images`。
+
+* 每个工具都在进程内调用对应的 `/civitai-helper/v1` 路由，结果与 HTTP API 相同。耗时的工具（扫描、下载、预览图、范例图、卡片信息）默认等任务完成，执行期间会发送进度通知。
+* 客户端发送 `Authorization: Bearer <token>`（或 `X-MCP-Token`、`?token=`）。token 在第一次启动时自动生成，显示在 设置 -> Civitai Helper，也可以在那里关闭服务器；环境变量 `CIVITAI_HELPER_MCP_TOKEN` 优先。
+* 不需要额外的依赖（协议实现在 `scripts/ch_lib/mcp_server.py`）。
+
+```bash
+# Claude Code
+claude mcp add --transport http civitai-helper http://127.0.0.1:7860/civitai-helper/mcp --header "Authorization: Bearer <token>"
 ```
 
 ## 设置
