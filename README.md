@@ -44,7 +44,7 @@ Civitai: [Civitai Url](https://civitai.com/models/16768/civitai-helper-sd-webui-
   - 🌐: Open this model's Civitai url in a new tab
   - 💡: Add this model's trigger words to prompt
   - 🏷: Use this model's preview image's prompt
-* Example images & card info (this fork, see below): fetch missing previews, write example prompts onto the cards, download all example images, and add images other civitai users posted as extra examples (API).
+* Example images & card info (this fork, see below): fetch missing previews, write example prompts onto the cards, download all example images, add images other civitai users posted as extra examples (API), and keep pictures you generated as examples of the LoRAs they used.
 * HTTP API (this fork, see below) for scripts and assistants.
 
 # Install
@@ -106,6 +106,17 @@ To download a model by Civitai Model Page's Url, you need 3 steps:
 Detail will be displayed on console log, with a progress bar.   
 Downloading can resume from break-point, so no fear for large file.   
 
+File names (this fork): a version that is already installed — under any name, in any subfolder — is not downloaded again (the log and the API say where it is; a file with civitai's name and the same SHA256 but no info file only gets its info and preview). The file is saved under civitai's file name; when another model already uses that name (typically a new version whose file is named like the old one), it is saved as `name_<version>` (e.g. `style_v2.0.safetensors`) instead of a silent `name_2`. The same applies to the card's "download new version" button. Through the API, `on_conflict: "error"` downloads nothing in that case and reports the conflict.
+
+### Check Model File Names
+Older downloads may have left `name_2.safetensors` files (a version downloaded twice) whose info, preview and example images are named `name_2.*` while civitai and the LoRA's own alias say `name`. The "Check Model File Names" section of the Civitai Helper tab (also `GET /check-names`) lists:
+
+* **rename**: the file name is civitai's name plus `_2` / `_3` and civitai's name is free → rename it back.
+* **merge**: several copies of the same civitai version with the same file size → keep one (the one named like civitai, else the one with most added examples) and merge the others into it.
+* **check by hand**: civitai's name is used by another model, or copies of the same version differ in size.
+
+"Fix File Names" (also `POST /fix-names`) applies the renames and merges. Renaming moves every file of the model (as `/rename-model`) and updates the model's name in the prompts of its added examples and in its card text; merging moves the added examples (#101+, renumbered), the civitai example images, the card file and the preview the kept copy lacks, then deletes the extra copy. Models you renamed on purpose (a name that is not just civitai's name plus `_N`) are left alone. Prompts elsewhere that use the old `<lora:name_2:…>` must be updated; the response lists them in `mapping`.
+
 ## Checking Model's New Version
 You can checking your local model's new version from civitai by model types. You can select multiple model types.   
 ![](img/check_model_new_version.jpg)  
@@ -163,6 +174,13 @@ They are numbered from 101 (`model_file.example_101.jpeg`) so they never collide
 
 `/models/{type}/examples` lists them after the civitai examples with `"source": "user"`, the username, the civitai image page and the LoRAs used. "Write Example Prompt to Cards" adds their prompts to the card notes as "Example #101 (by X on civitai)". `/remove-user-examples` deletes them by image id, number or all at once, and deleting the card with 🗑 removes them together with the model.
 
+### Add Local Images as Examples
+Pictures you generated can be kept as example images of a model too. In the "Add Local Images as Examples" section of the Civitai Helper tab, drop one or more images (PNG / JPEG / WebP), pick the model type and the models, and click "Add as Example Images". The LoRAs in the image's prompt (`<lora:name:weight>`) are picked automatically, and for checkpoints the image's `Model`.
+
+The file is saved as it is, with the next free number from 101 (`model_file.example_101.png`, shared with the civitai user images above), so its generation info stays inside. The prompt, negative prompt, steps, sampler, CFG, seed, size, checkpoint, clip skip and LoRAs are read from it (the WebUI's own infotext parser) and kept in `model_file.examples.json` with `"source": "local"`. Adding the same picture again keeps its number. `/models/{type}/examples` lists them with `"source": "local"` and the original file name, "Write Example Prompt to Cards" adds their prompts to the card notes as "Example #101 (local image)", and `/remove-user-examples` deletes them (by number, or `all` with `"source": "local"`).
+
+The same is available as HTTP API (`/add-local-examples`) and MCP tool (`civitai_add_local_examples`): the image is sent as base64 / data URL (`image`), or given as a file in the WebUI's output folders (`path`; other paths are refused). Without `name` it goes to every local LoRA in its prompt (or, with `"type": "ckp"`, to its checkpoint). For images without generation info, `prompt`, `negative_prompt`, `steps`, `sampler`, `cfg_scale`, `seed` and `model` can be given: at the top level they only fill what an image's own info lacks, inside `images[]` they replace it; `nsfw` marks the image.
+
 ## HTTP API
 The extension registers a small REST API on the WebUI at `/civitai-helper/v1`. It is listed in the WebUI's Swagger page (`/docs`) once the app has started and uses the same basic-auth credentials as `--api-auth` when that flag is set. It works without `--api`.
 
@@ -180,15 +198,18 @@ Read-only endpoints answer immediately; long-running work runs on one background
 | GET | `/civitai/models?query=&types=&base_model=&limit=&sort=&period=&username=&tag=&nsfw=&cursor=` | search civitai for models; answers civitai's own JSON plus `_query`. `base_model` (repeatable) understands short forms such as `illu`, `sd1.5`, `pony`, `flux`, and when civitai's text search combined with a base model finds too little, the text alone is searched too and filtered by base model |
 | GET | `/civitai/images?username=&model=&model_version_id=&sort=&period=&nsfw=&limit=&cursor=` | search the images people posted on civitai, with their generation data: by user, by model (id or page URL, `?modelVersionId=` narrows to a version), or both; `nsfw` = highest level (`None`, `Soft`, `Mature`, `X`) |
 | POST | `/scan` | body `{"model_types": ["lora"]}`; fetch missing info files and previews (SHA256 match) |
-| POST | `/download` | body `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`; download a version with info file and preview |
+| POST | `/download` | body `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?, "on_conflict"?}`; download a version with info file and preview. A version that is already installed is not downloaded again (`status: "exists"`, `existing`); the file gets civitai's file name, or `name_<version>` when another model has it (`renamed: true`; `on_conflict: "error"` downloads nothing instead, `status: "conflict"`). The result has `name`, `prompt_tag` and `civitai_file_name` |
+| GET | `/check-names` | `?model_types=lora` (repeatable); models named civitai's name + `_2` / `_3` and duplicate copies of one version, each with `action` (`rename` / `merge` / `conflict`), `target` and `reason` |
+| POST | `/fix-names` | body `{"model_types"?, "names"?, "merge"?: true}`; apply the `/check-names` suggestions (only `names` when given): rename back, merge copies (the extra copy is deleted). Returns `results`, `skipped` and `mapping` (old name → new name) |
 | POST | `/check-new-version` | body `{"model_types": [...]}`; installed models that have a newer version |
 | POST | `/fetch-previews` | body `{"model_types": [...]}` or `{"type", "name"}`; same as the "Fetch Missing Previews" button |
 | POST | `/download-examples` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `max_images` (0 = all) and `overwrite` |
 | POST | `/write-card-info` | body `{"model_types": [...]}` or `{"type", "name"}`, plus `overwrite` and `set_sd_version` |
 | POST | `/add-user-examples` | save images that civitai users posted as extra examples of one model (`model_file.example_101.jpeg`, …): body `{"type", "name"}` plus either `image_ids` (e.g. picked from a civitai image search) or `username` (that user's images made with this model's version; `all_versions`, `max_images`, `sort`, `period`); NSFW images are included by default (`nsfw` = highest level to search, `"None"` for SFW only; `skip_nsfw` drops NSFW images), videos are skipped |
-| POST | `/remove-user-examples` | body `{"type", "name"}` plus `image_ids`, `indexes` or `all: true` |
+| POST | `/add-local-examples` | save locally generated images as extra examples (`model_file.example_101.png`, …), keeping the file and reading its prompt / parameters: body `image` (base64 or data URL) or `path` (a file in the WebUI's output folders) or `images: [{data or path, file_name, prompt, …}]`; `type` (default `lora`) and `name`, or no `name` = every local LoRA in the image's prompt (`ckp`: its checkpoint); optional `prompt`, `negative_prompt`, `steps`, `sampler`, `cfg_scale`, `seed`, `model` for images without generation info, `nsfw`, `overwrite` |
+| POST | `/remove-user-examples` | body `{"type", "name"}` plus `image_ids`, `indexes` or `all: true` (`source`: `user` or `local` limits `all`); removes civitai user images and local images |
 | POST | `/delete-model` | body `{"type", "name"}`; delete one model for good, like the 🗑 button: the model file, its info files, previews, card metadata (`.json`) and example images. Refresh the WebUI's list afterwards (`POST /sdapi/v1/refresh-loras`) |
-| POST | `/rename-model` | body `{"type", "name", "new_name"}`; rename one model together with its info files, previews, card metadata (`.json`) and example images, inside the same folder. Without an extension `new_name` keeps the current one; ending it in `.safetensors`, `.ckpt`, `.pt` or `.bin` changes the model file's extension too (the file is not converted, and `warnings` reports a format mismatch or an extension the WebUI does not list). Nothing is renamed if a target file already exists, if another model of the same type already has that name, or if the name contains `/ \ : * ? " < > \|`; a failure half way is rolled back. The response lists every renamed file, the new `prompt_tag`, the LoRA's embedded `alias` if it has one, and the core endpoint to call next in `refresh` |
+| POST | `/rename-model` | body `{"type", "name", "new_name"}`; rename one model together with its info files, previews, card metadata (`.json`) and example images, inside the same folder. Without an extension `new_name` keeps the current one; ending it in `.safetensors`, `.ckpt`, `.pt` or `.bin` changes the model file's extension too (the file is not converted, and `warnings` reports a format mismatch or an extension the WebUI does not list). Nothing is renamed if a target file already exists, if another model of the same type already has that name, or if the name contains `/ \ : * ? " < > \|`; a failure half way is rolled back. The model's name in the prompts of its added examples and in its card text is updated (`prompts_updated`). The response lists every renamed file, the new `prompt_tag`, the LoRA's embedded `alias` if it has one, and the core endpoint to call next in `refresh` |
 | GET | `/tasks`, `/tasks/{id}?wait=&timeout=` | recent tasks / one task |
 
 All task endpoints accept `"wait": true` and `"timeout": <seconds>` in the body. Example:
@@ -210,6 +231,11 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/write-card-info \
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
   -H 'Content-Type: application/json' \
   -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
+
+# keep a picture from the txt2img output as an example of every LoRA in its prompt
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-local-examples \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "output/txt2img-images/2026-10-18/00012-239564074.png"}'
 
 # delete a LoRA in a subfolder with all its files, then refresh the WebUI's LoRA list
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
@@ -234,7 +260,7 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
 ```
 
 ## MCP server
-Everything the HTTP API can do is also offered as a [Model Context Protocol](https://modelcontextprotocol.io) server at `/civitai-helper/mcp` (Streamable HTTP), so AI agents such as Claude Code, Claude Desktop or Codex can manage your models directly. Tools: `civitai_lora_inventory`, `civitai_list_local_models`, `civitai_local_model_info`, `civitai_model_examples`, `civitai_lookup_model`, `civitai_download_model`, `civitai_scan_models`, `civitai_check_new_versions`, `civitai_fetch_previews`, `civitai_download_examples`, `civitai_add_user_examples`, `civitai_remove_user_examples`, `civitai_write_card_info`, `civitai_rename_model`, `civitai_delete_model`, `civitai_model_types`, `civitai_task_status`, `civitai_search_models`, `civitai_search_images`.
+Everything the HTTP API can do is also offered as a [Model Context Protocol](https://modelcontextprotocol.io) server at `/civitai-helper/mcp` (Streamable HTTP), so AI agents such as Claude Code, Claude Desktop or Codex can manage your models directly. Tools: `civitai_lora_inventory`, `civitai_list_local_models`, `civitai_local_model_info`, `civitai_model_examples`, `civitai_lookup_model`, `civitai_download_model`, `civitai_scan_models`, `civitai_check_new_versions`, `civitai_fetch_previews`, `civitai_download_examples`, `civitai_add_user_examples`, `civitai_add_local_examples`, `civitai_remove_user_examples`, `civitai_write_card_info`, `civitai_rename_model`, `civitai_check_names`, `civitai_fix_names`, `civitai_delete_model`, `civitai_model_types`, `civitai_task_status`, `civitai_search_models`, `civitai_search_images`.
 
 * Each tool calls the matching `/civitai-helper/v1` route in-process, so the results are the same as the HTTP API. Long-running tools (scan, download, previews, examples, card info) wait for the task by default and send progress notifications while it runs.
 * Clients send `Authorization: Bearer <token>` (or `X-MCP-Token`, or `?token=`). The token is generated on first start and shown under Settings -> Civitai Helper, where the server can also be turned off; the environment variable `CIVITAI_HELPER_MCP_TOKEN` overrides it.
@@ -368,6 +394,17 @@ Since v1.5.5, we've already optimized the SHA256 function to the top. So the onl
 
 
 # Change Log
+## v1.18.0 (this fork)
+* Downloads (`/download`, the Download section, the card's "download new version" button) no longer save a second copy of a version that is already installed, and use `name_<version>` instead of a silent `name_2` when civitai's file name is taken by another model. A file with civitai's name and SHA256 but no info only gets its info. `/download` takes `on_conflict` and returns `status`, `name`, `prompt_tag`, `civitai_file_name`, `renamed`.
+* "Check Model File Names" (tab section, `GET /check-names`, `POST /fix-names`, MCP `civitai_check_names` / `civitai_fix_names`): rename `name_2` models back to civitai's name and merge duplicate copies of one version (added example images move to the copy that stays).
+* Renaming a model (`/rename-model`, `/fix-names`) also updates its name in the prompts of its added examples and in its card text.
+
+## v1.17.0 (this fork)
+* "Add Local Images as Examples" (Civitai Helper tab, HTTP API `/add-local-examples`, MCP tool `civitai_add_local_examples`): keep pictures you generated as example images #101+ of a model. The file is kept as it is, its prompt and parameters are read from its generation info, and the LoRAs of its prompt (or its checkpoint) are picked automatically. API paths are limited to the WebUI's output folders.
+* `/models/{type}/examples` marks them `"source": "local"` (count `local_images`), the card notes call them "local image", and `/remove-user-examples` removes them too (`source` narrows `all`).
+* Adding civitai user images no longer drops local examples of the same model from `model_file.examples.json`.
+* Every route that takes a model `name` also accepts it without the extension (the name used in `<lora:name:1>`) when exactly one model of that type has it.
+
 ## v1.16.0 (this fork)
 * MCP server at `/civitai-helper/mcp`: every HTTP API feature as Model Context Protocol tools for AI agents (Claude Code / Desktop, Codex ...), with a bearer token (Settings -> Civitai Helper) and progress notifications for long tasks.
 * HTTP API `/civitai/models` and `/civitai/images` (MCP tools `civitai_search_models`, `civitai_search_images`): search civitai for models (base-model short forms, text-search fallback) and for the images people posted with their generation data. They use the domain, API key and proxy from Settings.

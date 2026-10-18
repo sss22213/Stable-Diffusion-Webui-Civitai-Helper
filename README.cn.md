@@ -32,7 +32,7 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
   - 🌐: 在新标签页打开这个模型的Civitai页面
   - 💡: 一键添加这个模型的触发词到关键词输入框
   - 🏷: 一键使用这个模型预览图所使用的关键词
-* 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图，并可通过 API 把其他 civitai 用户发布的图片加为额外范例。
+* 范例图与卡片信息（本分支，见下文）：补齐预览图、把范例关键词写到卡片、下载全部范例图，可通过 API 把其他 civitai 用户发布的图片加为额外范例，也可以把自己生成的图存为所用 LoRA 的范例。
 * HTTP API（本分支，见下文），供脚本与助手使用。
 * 用卡片上的 🗑 删除模型时（本分支）会一并删除范例图与卡片信息文件（`模型名.json`），不留下孤立文件；也可通过 API（`/delete-model`）删除。
 * 可通过 API（`/rename-model`，本分支）重命名模型，模型文件与信息文件、预览图、卡片信息和范例图会一起改名。
@@ -98,6 +98,17 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 下载过程会显示在命令行界面带个进度条。  
 支持断点续传，无畏大文件。  
 
+文件名（本分支）：已经装过的版本（不论名称、子目录）不会重复下载（日志与 API 会说明位置；同名、SHA256 相同但缺少信息文件的文件只会补上信息与预览图）。文件以 civitai 的文件名保存；该名称已被其他模型使用时（常见于新版本与旧版本同名），改存为 `名称_<版本>`（例如 `style_v2.0.safetensors`），不再默默变成 `名称_2`。卡片上的“下载新版本”按钮也一样。通过 API 时，`on_conflict: "error"` 会在这种情况下不下载并回报冲突。
+
+### Check Model File Names（检查模型文件名）
+较早的下载可能留下 `名称_2.safetensors`（同一版本下载了两次），它的信息、预览图与范例图都叫 `名称_2.*`，而 civitai 与 LoRA 内嵌的别名仍是 `名称`。Civitai Helper 页面的 "Check Model File Names" 区块（也可用 `GET /check-names`）会列出：
+
+* **rename**：文件名是 civitai 名称加 `_2` / `_3`，且原名没被占用 → 改回原名。
+* **merge**：同一 civitai 版本、文件大小相同的多个副本 → 保留一个（与 civitai 同名者优先，其次是加入范例最多者），其余合并进来。
+* **check by hand**：原名被其他模型使用，或同一版本的副本大小不同。
+
+"Fix File Names"（也可用 `POST /fix-names`）会执行改名与合并。改名会搬动模型的所有文件（同 `/rename-model`），并更新它加入的范例与卡片文字中 prompt 里的模型名称；合并会把多余副本的加入范例（#101 起，重新编号）、保留副本缺少的 civitai 范例图、卡片文件与预览图搬过去，再删除多余副本。刻意改过的名称（不只是 civitai 名称加 `_N`）不会被动到。其他地方仍使用旧的 `<lora:名称_2:…>` 的 prompt 需要自行更新，返回的 `mapping` 会列出旧名 → 新名。
+
 
 ## 批量检查模型新版本
 你可以按照模型类型，批量检查你的本地模型，在civitai上的新版本。你可以选择多个模型类型。  
@@ -152,6 +163,13 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 
 `/models/{type}/examples` 会把它们列在 civitai 范例之后，并带有 `"source": "user"`、用户名、civitai 图片页面与用到的 LoRA。"Write Example Prompt to Cards" 会把它们的关键词加到卡片备注中，标题为 "Example #101 (by X on civitai)"。`/remove-user-examples` 可按图片 ID、编号或全部删除；用卡片上的 🗑 删除模型时也会一并删除。
 
+### Add Local Images as Examples（把本地生成的图加为范例）
+自己生成的图也可以存为模型的范例图。在 Civitai Helper 页面的 "Add Local Images as Examples" 区块拖入一张或多张图（PNG / JPEG / WebP），选择模型类型与模型，按 "Add as Example Images"。图片关键词里的 LoRA（`<lora:名称:权重>`）会自动选上；checkpoint 则按图片的 `Model`。
+
+文件原样保存，编号接在 101 之后（`模型名.example_101.png`，与上面的 civitai 用户图片共用编号），生成信息仍在图里。关键词、反向关键词、步数、采样器、CFG、种子、尺寸、checkpoint、clip skip 与 LoRA 由图片读出（使用 WebUI 自己的 infotext 解析），记录在 `模型名.examples.json`，标为 `"source": "local"`。重复加入同一张图会保留原编号。`/models/{type}/examples` 会带 `"source": "local"` 与原文件名列出它们，"Write Example Prompt to Cards" 会把关键词加到卡片备注中，标题为 "Example #101 (local image)"，`/remove-user-examples` 可删除它们（按编号，或 `all` 加 `"source": "local"`）。
+
+同样的功能也有 HTTP API（`/add-local-examples`）与 MCP 工具（`civitai_add_local_examples`）：图片以 base64 / data URL 传入（`image`），或指定 WebUI 输出目录中的文件（`path`，其他路径会被拒绝）。不给 `name` 时会加到关键词里每个本地 LoRA（`"type": "ckp"` 时是它的 checkpoint）。没有生成信息的图片可以另外给 `prompt`、`negative_prompt`、`steps`、`sampler`、`cfg_scale`、`seed`、`model`：放在最外层时只补图片本身缺少的信息，放在 `images[]` 里则会取代它；`nsfw` 可标记图片。所有带模型 `name` 的路由也接受不带扩展名的名称（`<lora:名称:1>` 里的名称），只要该类型中只有一个模型叫这个名字。
+
 ## HTTP API
 扩展在 WebUI 上注册了一组 REST API，路径为 `/civitai-helper/v1`。启动完成后可在 WebUI 的 Swagger 页面（`/docs`）看到；若启动时带了 `--api-auth`，这些接口使用同一组账号密码。不需要 `--api` 参数。
 
@@ -169,13 +187,16 @@ Stable Diffusion Webui 扩展Civitai助手，用于更轻松的管理和使用Ci
 | GET | `/civitai/models?query=&types=&base_model=&limit=&sort=&period=&username=&tag=&nsfw=&cursor=` | 在 civitai 搜索模型，回传 civitai 原始 JSON 加上 `_query`。`base_model`（可重复）认得 `illu`、`sd1.5`、`pony`、`flux` 等简写；文字搜索配合底模找到太少时，会再单用文字搜索并按底模过滤 |
 | GET | `/civitai/images?username=&model=&model_version_id=&sort=&period=&nsfw=&limit=&cursor=` | 搜索用户在 civitai 发布的图片（含生成参数）：按用户、按模型（id 或页面网址，`?modelVersionId=` 限定版本）或两者；`nsfw` 为最高等级（`None`、`Soft`、`Mature`、`X`） |
 | POST | `/scan` | 请求体 `{"model_types": ["lora"]}`；补齐缺失的信息文件与预览图（SHA256 匹配） |
-| POST | `/download` | 请求体 `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?}`；下载版本并保存信息文件与预览图 |
+| POST | `/download` | 请求体 `{"url_or_id", "version_id"?, "version"?, "subfolder": "/", "create_subfolder"?, "dl_all"?, "on_conflict"?}`；下载版本并保存信息文件与预览图。已经装过的版本不会重复下载（`status: "exists"`、`existing`）；文件使用 civitai 的文件名，该名称已被其他模型使用时改存为 `名称_<版本>`（`renamed: true`；`on_conflict: "error"` 则不下载，`status: "conflict"`）。返回 `name`、`prompt_tag`、`civitai_file_name` |
+| GET | `/check-names` | `?model_types=lora`（可重复）；列出文件名为 civitai 名称加 `_2` / `_3` 的模型，以及同一版本的重复副本，每项带 `action`（`rename` / `merge` / `conflict`）、`target`、`reason` |
+| POST | `/fix-names` | 请求体 `{"model_types"?, "names"?, "merge"?: true}`；套用 `/check-names` 的建议（给 `names` 时只处理这些）：改回原名、合并副本（多余的副本会被删除）。返回 `results`、`skipped` 与 `mapping`（旧名 → 新名） |
 | POST | `/check-new-version` | 请求体 `{"model_types": [...]}`；列出有新版本的本地模型 |
 | POST | `/fetch-previews` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`；等同 "Fetch Missing Previews" 按钮 |
 | POST | `/download-examples` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `max_images`（0 = 全部）与 `overwrite` |
 | POST | `/write-card-info` | 请求体 `{"model_types": [...]}` 或 `{"type", "name"}`，另有 `overwrite` 与 `set_sd_version` |
 | POST | `/add-user-examples` | 把 civitai 用户发布的图片存为单个模型的额外范例（`模型名.example_101.jpeg`……）：请求体 `{"type", "name"}`，加上 `image_ids`（例如从 civitai 图片搜索挑出的）或 `username`（该用户用这个模型版本生成的图；可选 `all_versions`、`max_images`、`sort`、`period`）；默认包含 NSFW 图片（`nsfw` 为搜索的最高等级，`"None"` 仅 SFW；`skip_nsfw` 可排除 NSFW），视频会被跳过 |
-| POST | `/remove-user-examples` | 请求体 `{"type", "name"}`，加上 `image_ids`、`indexes` 或 `all: true` |
+| POST | `/add-local-examples` | 把本地生成的图存为额外范例（`模型名.example_101.png`……），文件原样保存并读出关键词与参数：请求体 `image`（base64 或 data URL）、`path`（WebUI 输出目录中的文件）或 `images: [{data 或 path, file_name, prompt, …}]`；`type`（默认 `lora`）与 `name`，不给 `name` = 关键词里每个本地 LoRA（`ckp`：它的 checkpoint）；没有生成信息时可给 `prompt`、`negative_prompt`、`steps`、`sampler`、`cfg_scale`、`seed`、`model`，以及 `nsfw`、`overwrite` |
+| POST | `/remove-user-examples` | 请求体 `{"type", "name"}`，加上 `image_ids`、`indexes` 或 `all: true`（`source`：`user` 或 `local` 限定 `all`）；civitai 用户图片与本地图片都可删除 |
 | POST | `/delete-model` | 请求体 `{"type", "name"}`；永久删除单个模型，与卡片上的 🗑 按钮相同：模型文件、信息文件、预览图、卡片信息（`.json`）与范例图。之后请刷新 WebUI 的模型列表（`POST /sdapi/v1/refresh-loras`） |
 | POST | `/rename-model` | 请求体 `{"type", "name", "new_name"}`；在原目录内重命名单个模型，连同信息文件、预览图、卡片信息（`.json`）与范例图一起改名。`new_name` 不带扩展名时保留原扩展名；以 `.safetensors`、`.ckpt`、`.pt` 或 `.bin` 结尾时，模型文件的扩展名也会一并更改（不会转换文件格式，格式不符或 WebUI 不会列出该扩展名时会在 `warnings` 中提示）。目标文件已存在、同类型已有同名模型，或名称含有 `/ \ : * ? " < > \|` 时不会改动任何文件；中途失败会全部还原。返回所有改名的文件、新的 `prompt_tag`、LoRA 内嵌的别名 `alias`（如有），以及接下来要调用的刷新接口 `refresh` |
 | GET | `/tasks`、`/tasks/{id}?wait=&timeout=` | 最近的任务 / 单个任务 |
@@ -200,6 +221,11 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-user-examples \
   -H 'Content-Type: application/json' \
   -d '{"type": "lora", "name": "Maha-10.safetensors", "username": "someone", "sort": "Newest", "max_images": 10, "wait": true}'
 
+# 把 txt2img 输出的一张图加为它关键词里每个 LoRA 的范例
+curl -X POST http://127.0.0.1:7860/civitai-helper/v1/add-local-examples \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "output/txt2img-images/2026-10-18/00012-239564074.png"}'
+
 # 连同所有相关文件删除子目录中的某个 LoRA，然后刷新 WebUI 的 LoRA 列表
 curl -X POST http://127.0.0.1:7860/civitai-helper/v1/delete-model \
   -H 'Content-Type: application/json' -d '{"type": "lora", "name": "characters/Maha-10.safetensors"}'
@@ -223,7 +249,7 @@ curl -X POST http://127.0.0.1:7860/civitai-helper/v1/rename-model \
 ```
 
 ## MCP 服务器
-HTTP API 能做的事，也以 [Model Context Protocol](https://modelcontextprotocol.io) 服务器的形式提供在 `/civitai-helper/mcp`（Streamable HTTP），Claude Code、Claude Desktop、Codex 等 AI 代理可以直接管理你的模型。工具：`civitai_lora_inventory`、`civitai_list_local_models`、`civitai_local_model_info`、`civitai_model_examples`、`civitai_lookup_model`、`civitai_download_model`、`civitai_scan_models`、`civitai_check_new_versions`、`civitai_fetch_previews`、`civitai_download_examples`、`civitai_add_user_examples`、`civitai_remove_user_examples`、`civitai_write_card_info`、`civitai_rename_model`、`civitai_delete_model`、`civitai_model_types`、`civitai_task_status`、`civitai_search_models`、`civitai_search_images`。
+HTTP API 能做的事，也以 [Model Context Protocol](https://modelcontextprotocol.io) 服务器的形式提供在 `/civitai-helper/mcp`（Streamable HTTP），Claude Code、Claude Desktop、Codex 等 AI 代理可以直接管理你的模型。工具：`civitai_lora_inventory`、`civitai_list_local_models`、`civitai_local_model_info`、`civitai_model_examples`、`civitai_lookup_model`、`civitai_download_model`、`civitai_scan_models`、`civitai_check_new_versions`、`civitai_fetch_previews`、`civitai_download_examples`、`civitai_add_user_examples`、`civitai_add_local_examples`、`civitai_remove_user_examples`、`civitai_write_card_info`、`civitai_rename_model`、`civitai_check_names`、`civitai_fix_names`、`civitai_delete_model`、`civitai_model_types`、`civitai_task_status`、`civitai_search_models`、`civitai_search_images`。
 
 * 每个工具都在进程内调用对应的 `/civitai-helper/v1` 路由，结果与 HTTP API 相同。耗时的工具（扫描、下载、预览图、范例图、卡片信息）默认等任务完成，执行期间会发送进度通知。
 * 客户端发送 `Authorization: Bearer <token>`（或 `X-MCP-Token`、`?token=`）。token 在第一次启动时自动生成，显示在 设置 -> Civitai Helper，也可以在那里关闭服务器；环境变量 `CIVITAI_HELPER_MCP_TOKEN` 优先。

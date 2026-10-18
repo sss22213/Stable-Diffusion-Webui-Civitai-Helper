@@ -55,16 +55,20 @@ def iter_models(model_type: str):
 
 
 def find(model_type: str, name: str):
-    """Find one model by file name or by path relative to the model folder.
+    """Find one model by file name or by path relative to the model folder; without an extension
+    (the name in <lora:name:1>) it matches when exactly one model has that name.
     Returns (folder, dir, path, filename) or None."""
     wanted = (name or "").replace("\\", "/").strip().lstrip("/")
     if not wanted:
         return None
+    by_stem = []
     for folder, root, path, filename in iter_models(model_type):
         rel = util.get_relative_path(path, folder).replace("\\", "/")
         if filename == wanted or rel == wanted:
             return folder, root, path, filename
-    return None
+        if os.path.splitext(filename)[0] == wanted or os.path.splitext(rel)[0] == wanted:
+            by_stem.append((folder, root, path, filename))
+    return by_stem[0] if len(by_stem) == 1 else None
 
 
 # ---------------------------------------------------------------------------

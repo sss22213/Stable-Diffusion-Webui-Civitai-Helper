@@ -10,6 +10,7 @@ from . import civitai
 from . import msg_handler
 from . import downloader
 from . import examples
+from . import naming
 
 
 
@@ -208,6 +209,16 @@ def use_preview_image_prompt(msg):
 
 # download model's new verson by model path, version id and download url
 # output is a md log
+def model_type_of(model_path: str) -> str:
+    """The model type (ti / hyper / ckp / lora) whose folder holds this file ("lora" when unsure)."""
+    full = os.path.abspath(model_path)
+    for model_type, folder in model.folders.items():
+        root = os.path.abspath(folder)
+        if full.startswith(root + os.sep):
+            return model_type
+    return "lora"
+
+
 def dl_model_new_version(msg, max_size_preview, skip_nsfw_preview):
     util.printD("Start dl_model_new_version")
 
@@ -259,15 +270,32 @@ def dl_model_new_version(msg, max_size_preview, skip_nsfw_preview):
     #     util.printD(output)
     #     return output
 
+    # the card button may be clicked twice: a version that is already here is not downloaded again
+    copies = naming.existing_copies(model_type_of(model_path), version_id)
+    if copies:
+        output = "This model version is already existed: " + ", ".join(c[2] for c in copies)
+        util.printD(output)
+        return output
+
+    # a new version's file often has the old version's name: use the name plus the version
+    # ("name_v2.0") instead of a silent name_2
+    dl_path = None
+    version_info = civitai.get_version_info_by_version_id(version_id)
+    if version_info:
+        picked = naming.pick_download_name(model_type_of(model_path), model_folder, version_info,
+                                           naming.model_file_of_version(version_info))
+        if picked:
+            dl_path = os.path.join(model_folder, picked[0])
+
     # download file
-    new_model_path = downloader.dl(download_url, model_folder, None, None)
+    new_model_path = downloader.dl(download_url, model_folder, None, dl_path)
     if not new_model_path:
         output = "Download failed, check console log for detail. Download url: " + download_url
         util.printD(output)
         return output
 
     # get version info
-    version_info = civitai.get_version_info_by_version_id(version_id)
+    version_info = version_info or civitai.get_version_info_by_version_id(version_id)
     if not version_info:
         output = "Model downloaded, but failed to get version info, check console log for detail. Model saved to: " + new_model_path
         util.printD(output)

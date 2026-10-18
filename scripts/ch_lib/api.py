@@ -19,11 +19,21 @@ POST /fetch-previews, /download-examples and /write-card-info are tasks that
 work on a list of model types or on one model (type + name).
 POST /add-user-examples saves images that civitai users posted (by image id,
 or "everything user X made with this model") as extra examples #101+ of one
-model; POST /remove-user-examples deletes them again.
+model; POST /add-local-examples does the same for images generated locally
+(uploaded as base64, or a file in the WebUI's output folders), by default for
+every LoRA in the image's prompt; POST /remove-user-examples deletes them again.
 
 POST /rename-model and POST /delete-model rename or delete one local model
 together with every file that belongs to it (info, previews, card metadata,
-example images).
+example images); renaming also updates the model's name in the prompts of its
+added examples and card text.
+
+GET /check-names lists models whose file name is civitai's name plus a _2 / _3
+suffix (left by downloading a version twice) and duplicate copies of the same
+version; POST /fix-names renames them back / merges the copies (see
+ch_lib/naming.py). POST /download no longer downloads a version that is already
+there, and uses "name_<version>" instead of a silent "name_2" when civitai's
+file name is taken.
 
 GET /civitai/models and GET /civitai/images search civitai itself (models;
 images people posted, with their generation data) and answer civitai's JSON
@@ -34,6 +44,8 @@ are required for every route here.
 """
 import os
 import re
+import base64
+import binascii
 import errno
 import struct
 import time
@@ -59,6 +71,7 @@ from . import ch_settings
 from . import local_models
 from . import examples
 from . import model_action_civitai
+from . import naming
 
 
 PREFIX = "/civitai-helper/v1"
@@ -346,8 +359,46 @@ class RemoveUserExamplesRequest(BaseModel):
     type: str = Field(..., description="ti | hyper | ckp | lora")
     name: str = Field(..., description="File name or path relative to the model folder")
     image_ids: Optional[List[int]] = Field(None, description="civitai image ids to remove")
-    indexes: Optional[List[int]] = Field(None, description="Example numbers to remove (101 and up)")
-    all: bool = Field(False, description="Remove every user-added example of this model")
+    indexes: Optional[List[int]] = Field(None, description="Example numbers to remove (101 and up; civitai user images and local images)")
+    all: bool = Field(False, description="Remove every added example (#101+) of this model")
+    source: Optional[str] = Field(None, description="With all=true: only 'user' (images from civitai users) or only 'local' (local images)")
+
+
+LOCAL_META_FIELDS = ("prompt", "negative_prompt", "steps", "sampler", "cfg_scale", "seed", "clip_skip", "model", "nsfw")
+
+
+def _local_meta(obj) -> dict:
+    return {k: getattr(obj, k) for k in LOCAL_META_FIELDS}
+
+
+class LocalImageMeta(BaseModel):
+    """Generation data for images without it. At the top level it only fills what an image's own
+    generation info lacks; inside images[] it replaces it."""
+    prompt: Optional[str] = Field(None, description="Prompt (default: read from the image's generation info)")
+    negative_prompt: Optional[str] = None
+    steps: Optional[int] = None
+    sampler: Optional[str] = None
+    cfg_scale: Optional[float] = None
+    seed: Optional[int] = None
+    clip_skip: Optional[int] = None
+    model: Optional[str] = Field(None, description="Checkpoint name")
+    nsfw: bool = Field(False, description="Mark the image as NSFW")
+
+
+class LocalImage(LocalImageMeta):
+    data: Optional[str] = Field(None, description="The image file as base64 or a data: URL (PNG / JPEG / WebP / GIF)")
+    path: Optional[str] = Field(None, description="Instead of data: an image file in the WebUI's output folders (absolute, or relative to the WebUI folder)")
+    file_name: Optional[str] = Field(None, description="Original file name, kept for reference")
+
+
+class AddLocalExamplesRequest(LocalImageMeta):
+    type: str = Field("lora", description="ti | hyper | ckp | lora")
+    name: Optional[str] = Field(None, description="File name or path relative to the model folder. Empty: every model of this type the image was made with (lora: the <lora:…> tags of its prompt; ckp: its checkpoint)")
+    image: Optional[str] = Field(None, description="One image as base64 or a data: URL (shortcut for images=[{data}])")
+    path: Optional[str] = Field(None, description="One image file in the WebUI's output folders (shortcut for images=[{path}])")
+    file_name: Optional[str] = None
+    images: Optional[List[LocalImage]] = Field(None, description="Several images, each with its own optional prompt / parameters; the top-level ones only fill what an image's generation info lacks")
+    overwrite: bool = Field(False, description="Re-save images that were added before (same file) and refresh their prompt")
 
 
 class DeleteModelRequest(BaseModel):
@@ -368,6 +419,13 @@ class DownloadRequest(TaskOptions):
     subfolder: str = Field("/", description="Subfolder under the model type's folder, e.g. '/' or '/characters'")
     create_subfolder: bool = False
     dl_all: bool = Field(False, description="Download every file of the version, not only the primary one")
+    on_conflict: str = Field("version", description="When another model already uses civitai's file name: 'version' saves it as name_<version> (default), 'error' downloads nothing and reports the conflict")
+
+
+class FixNamesRequest(BaseModel):
+    model_types: Optional[List[str]] = Field(None, description="Any of: ti, hyper, ckp, lora (default lora)")
+    names: Optional[List[str]] = Field(None, description="Only these models (names or paths from /check-names); default every suggestion")
+    merge: bool = Field(True, description="Also merge duplicate copies of the same civitai version into one and delete the others")
 
 
 def _user_images(username: str, version_ids: List[int], max_images: int, sort, period, nsfw):
@@ -415,6 +473,45 @@ _WEBUI_EXTS = {
     "ti": (".safetensors", ".pt", ".bin"),
     "hyper": (".pt",),
 }
+
+
+def _output_roots() -> List[str]:
+    """Folders the WebUI saves generated images to (the only places /add-local-examples reads paths from)."""
+    from modules import paths_internal
+
+    base = paths_internal.data_path
+    roots = {os.path.join(base, "output"), os.path.join(base, "outputs")}
+    for key in ("outdir_samples", "outdir_txt2img_samples", "outdir_img2img_samples", "outdir_extras_samples",
+                "outdir_hires_samples", "outdir_grids", "outdir_txt2img_grids", "outdir_img2img_grids", "outdir_save"):
+        v = (shared.opts.data.get(key) or "").strip()
+        if v:
+            roots.add(v if os.path.isabs(v) else os.path.join(base, v))
+    return sorted({os.path.realpath(r) for r in roots})
+
+
+def _local_image_bytes(img: "LocalImage") -> tuple:
+    """(bytes, file name) of one image given as base64 / data URL or as a path in the output folders."""
+    if img.data:
+        raw = img.data.strip()
+        if raw.startswith("data:"):
+            raw = raw.split(",", 1)[-1]
+        try:
+            return base64.b64decode(raw, validate=False), img.file_name
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, "image data is not valid base64")
+    if img.path:
+        from modules import paths_internal
+
+        p = img.path.strip()
+        full = os.path.realpath(p if os.path.isabs(p) else os.path.join(paths_internal.data_path, p))
+        roots = _output_roots()
+        if not any(full == r or full.startswith(r + os.sep) for r in roots):
+            raise HTTPException(400, f"path must be inside the WebUI's output folders: {roots}")
+        if not os.path.isfile(full):
+            raise HTTPException(404, f"no file {img.path}")
+        with open(full, "rb") as f:
+            return f.read(), img.file_name or os.path.basename(full)
+    raise HTTPException(400, "each image needs data (base64) or path")
 
 
 def _new_file_name(path: str, new_name: str):
@@ -521,6 +618,69 @@ def _apply_renames(plan: list, folder: str):
                 "rolled_back": not rollback_failed,
                 "rollback_failed": rollback_failed,
             })
+
+
+def rename_model(model_type: str, path: str, new_name: str, folder: str = None) -> dict:
+    """Rename one local model with every file that belongs to it (POST /rename-model, /fix-names).
+    The model's name in the prompts of its added examples and in its card text is updated too.
+    Raises HTTPException when the name is invalid or taken (nothing is renamed then).
+    folder: the model type's folder the model is in (looked up when not given)."""
+    if folder is None:
+        folder = next((f for f, _r, p, _n in local_models.iter_models(model_type)
+                       if os.path.abspath(p) == os.path.abspath(path)), model.folders[model_type])
+    filename = os.path.basename(path)
+    old_stem, old_ext = os.path.splitext(filename)
+    new_stem, new_ext = _new_file_name(path, new_name)
+    plan = _rename_plan(model_type, folder, path, new_stem, new_ext)
+    _apply_renames(plan, folder)
+    local_models._meta_cache.pop(path, None)
+
+    rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/")
+    new_path = plan[-1][1]
+    new_entry = local_models.entry(model_type, folder, os.path.dirname(new_path), new_path,
+                                   os.path.basename(new_path))
+    warnings = []
+    result = {
+        "type": model_type,
+        "old_name": rel(path),
+        "new_name": rel(new_path),
+        "renamed": [{"from": rel(s), "to": rel(d)} for s, d in plan],
+        "prompt_tag": new_entry.get("prompt_tag"),
+        "refresh": _REFRESH_ENDPOINTS.get(model_type),
+        "warnings": warnings,
+        "prompts_updated": examples.rename_in_texts(new_path, old_stem, new_stem, model_type) if new_stem != old_stem else 0,
+    }
+    if new_ext.lower() != old_ext.lower():
+        fmt = _detect_format(new_path)
+        if new_ext.lower() == ".safetensors" and fmt == "pytorch":
+            warnings.append(f"The file content is a PyTorch pickle, not safetensors. Renaming does not convert it, "
+                            f"so the WebUI will fail to load it as {new_ext}; rename it back to {old_ext}.")
+        elif new_ext.lower() != ".safetensors" and fmt == "safetensors":
+            warnings.append(f"The file content is safetensors. Renaming does not convert it, so the WebUI will "
+                            f"fail to load it as {new_ext}; rename it back to .safetensors.")
+        if new_ext.lower() not in _WEBUI_EXTS.get(model_type, ()):
+            warnings.append(f"The WebUI does not list {model_type} models ending in {new_ext} "
+                            f"(it uses {', '.join(_WEBUI_EXTS.get(model_type, ()))}), so this model will not appear there.")
+    if model_type == "lora" and new_stem != old_stem:
+        alias = local_models.read_safetensors_metadata(new_path).get("ss_output_name")
+        if alias and alias != new_stem:
+            result["alias"] = alias
+            if getattr(shared.opts, "lora_preferred_name", "Alias from file") != "Filename":
+                warnings.append(
+                    f"This LoRA has the alias '{alias}' stored inside the file. The WebUI setting "
+                    f"'When adding to prompt, refer to Lora by' is 'Alias from file', so its card still inserts "
+                    f"<lora:{alias}:1>. After the refresh both <lora:{new_stem}:...> and <lora:{alias}:...> work."
+                )
+        if alias != old_stem:
+            warnings.append(f"Prompts, styles and presets that use <lora:{old_stem}:...> no longer find this "
+                            f"LoRA; change them to <lora:{new_stem}:...> (the prompts of its added examples and "
+                            f"its card text were updated).")
+    elif model_type in ("ti", "hyper") and new_stem != old_stem:
+        warnings.append(f"Prompts that use the old name '{old_stem}' must be changed to '{new_stem}'.")
+    if not result["refresh"]:
+        warnings.append("Refresh the model list in the WebUI to see the new name.")
+    util.printD(f"rename-model {model_type} {rel(path)} -> {rel(new_path)}: {len(plan)} files")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +900,77 @@ def build_router() -> APIRouter:
         _folder, _root, path, _filename = _find_local_model(req.type, req.name)
         if not (req.image_ids or req.indexes or req.all):
             raise HTTPException(400, "give image_ids, indexes or all=true")
-        return examples.remove_user_examples(path, req.image_ids, req.indexes, req.all)
+        if req.source not in (None, "", "user", examples.LOCAL_SOURCE):
+            raise HTTPException(400, "source must be 'user' or 'local'")
+        return examples.remove_user_examples(path, req.image_ids, req.indexes, req.all, req.source)
+
+    @router.post("/add-local-examples", summary="Save locally generated images as extra examples (#101+) of local models")
+    def post_add_local_examples(req: AddLocalExamplesRequest):
+        """The image file is kept as it is (its generation info stays inside) and its prompt /
+        parameters are read from it, so the examples gallery and the card notes show them; give
+        prompt etc. for images without generation info. Without `name` the image goes to every
+        local model of `type` it was made with (lora: the <lora:…> tags of its prompt)."""
+        _check_model_type(req.type)
+        shared_meta = _local_meta(req)
+        items = list(req.images or [])
+        if req.image or req.path:
+            items.insert(0, LocalImage(data=req.image, path=req.path, file_name=req.file_name))
+        if not items:
+            raise HTTPException(400, "give image (base64), path, or images")
+        prepared = []
+        # the top-level values only fill what an image lacks (its own generation info comes first);
+        # values given inside images[] replace it
+        defaults = {k: v for k, v in shared_meta.items() if k != "nsfw" and v not in (None, "")}
+        for it in items:
+            data, file_name = _local_image_bytes(it)
+            meta = _local_meta(it)
+            prepared.append({**meta, "nsfw": meta["nsfw"] or req.nsfw, "defaults": defaults,
+                             "data": data, "file_name": file_name})
+
+        targets: "OrderedDict[str, tuple]" = OrderedDict()   # path -> (relative name, images)
+        unmatched = []
+        if (req.name or "").strip():
+            folder, _root, path, _filename = _find_local_model(req.type, req.name)
+            targets[path] = (util.get_relative_path(path, folder).replace("\\", "/"), prepared)
+        else:
+            for it in prepared:
+                try:
+                    meta = examples.effective_meta(examples.read_image_info(it["data"])["meta"], it)
+                except ValueError as e:
+                    raise HTTPException(400, f"{it['file_name'] or 'image'}: {e}")
+                names = examples.models_in_image(req.type, meta)
+                if not names:
+                    unmatched.append(it["file_name"] or f"image {len(unmatched) + 1}")
+                for rel in names:
+                    folder, _root, path, _filename = _find_local_model(req.type, rel)
+                    targets.setdefault(path, (rel, []))[1].append(it)
+            if not targets:
+                what = "<lora:…> tag of a local LoRA in its prompt" if req.type == "lora" else \
+                    "checkpoint name (Model) of a local checkpoint" if req.type == "ckp" else "model reference"
+                raise HTTPException(400, f"no {what} found in the image's generation info; give name")
+
+        results = []
+        for path, (rel, imgs) in targets.items():
+            r = examples.add_local_examples(path, imgs, req.overwrite)
+            r["name"] = rel
+            r.pop("path", None)
+            results.append(r)
+        added = sum(r["added"] for r in results)
+        existed = sum(r["existed"] for r in results)
+        failed = sum(r["failed"] for r in results)
+        parts = []
+        for r in results:
+            line = f"{r['name']}: {r['added']} added, {r['existed']} already there"
+            if r["failed"]:
+                errors = "; ".join(i.get("error") or "" for i in r["images"] if i.get("status") == "failed")
+                line += f", {r['failed']} failed ({errors})"
+            parts.append(line)
+        msg = "; ".join(parts)
+        if unmatched:
+            msg += f"; no matching model for: {', '.join(unmatched)}"
+        util.printD(f"add-local-examples {req.type}: {msg}")
+        return {"type": req.type, "added": added, "existed": existed, "failed": failed, "results": results,
+                "unmatched": unmatched, "message": msg}
 
     @router.post("/delete-model", summary="Delete one local model and every file that belongs to it")
     def post_delete_model(req: DeleteModelRequest):
@@ -771,57 +1001,33 @@ def build_router() -> APIRouter:
         `refresh` (e.g. POST /sdapi/v1/refresh-loras). Prompts that used the old name must be
         updated by hand."""
         _check_model_type(req.type)
-        folder, _root, path, filename = _find_local_model(req.type, req.name)
-        old_stem, old_ext = os.path.splitext(filename)
-        new_stem, new_ext = _new_file_name(path, req.new_name)
-        plan = _rename_plan(req.type, folder, path, new_stem, new_ext)
-        _apply_renames(plan, folder)
-        local_models._meta_cache.pop(path, None)
+        folder, _root, path, _filename = _find_local_model(req.type, req.name)
+        return rename_model(req.type, path, req.new_name, folder)
 
-        rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/")
-        new_path = plan[-1][1]
-        new_entry = local_models.entry(req.type, folder, os.path.dirname(new_path), new_path,
-                                       os.path.basename(new_path))
-        warnings = []
-        result = {
-            "type": req.type,
-            "old_name": rel(path),
-            "new_name": rel(new_path),
-            "renamed": [{"from": rel(s), "to": rel(d)} for s, d in plan],
-            "prompt_tag": new_entry.get("prompt_tag"),
-            "refresh": _REFRESH_ENDPOINTS.get(req.type),
-            "warnings": warnings,
-        }
-        if new_ext.lower() != old_ext.lower():
-            fmt = _detect_format(new_path)
-            if new_ext.lower() == ".safetensors" and fmt == "pytorch":
-                warnings.append(f"The file content is a PyTorch pickle, not safetensors. Renaming does not convert it, "
-                                f"so the WebUI will fail to load it as {new_ext}; rename it back to {old_ext}.")
-            elif new_ext.lower() != ".safetensors" and fmt == "safetensors":
-                warnings.append(f"The file content is safetensors. Renaming does not convert it, so the WebUI will "
-                                f"fail to load it as {new_ext}; rename it back to .safetensors.")
-            if new_ext.lower() not in _WEBUI_EXTS.get(req.type, ()):
-                warnings.append(f"The WebUI does not list {req.type} models ending in {new_ext} "
-                                f"(it uses {', '.join(_WEBUI_EXTS.get(req.type, ()))}), so this model will not appear there.")
-        if req.type == "lora" and new_stem != old_stem:
-            alias = local_models.read_safetensors_metadata(new_path).get("ss_output_name")
-            if alias and alias != new_stem:
-                result["alias"] = alias
-                if getattr(shared.opts, "lora_preferred_name", "Alias from file") != "Filename":
-                    warnings.append(
-                        f"This LoRA has the alias '{alias}' stored inside the file. The WebUI setting "
-                        f"'When adding to prompt, refer to Lora by' is 'Alias from file', so its card still inserts "
-                        f"<lora:{alias}:1>. After the refresh both <lora:{new_stem}:...> and <lora:{alias}:...> work."
-                    )
-            if alias != old_stem:
-                warnings.append(f"Prompts, styles and presets that use <lora:{old_stem}:...> no longer find this "
-                                f"LoRA; change them to <lora:{new_stem}:...>.")
-        elif req.type in ("ti", "hyper") and new_stem != old_stem:
-            warnings.append(f"Prompts that use the old name '{old_stem}' must be changed to '{new_stem}'.")
-        if not result["refresh"]:
-            warnings.append("Refresh the model list in the WebUI to see the new name.")
-        util.printD(f"rename-model {req.type} {rel(path)} -> {rel(new_path)}: {len(plan)} files")
-        return result
+    @router.get("/check-names", summary="Models named civitai's name + _2 / _3, and duplicate copies of one version")
+    def get_check_names(model_types: Optional[List[str]] = Query(None, description="Any of: ti, hyper, ckp, lora (default lora)")):
+        """Read-only. Each item says what /fix-names would do: rename (back to civitai's file
+        name), merge (into another copy of the same version; that copy keeps the added examples)
+        or conflict (needs a decision: shown only)."""
+        types = _normalize_types(model_types or ["lora"])
+        return naming.scan(types)
+
+    @router.post("/fix-names", summary="Rename _2 / _3 models back to civitai's name and merge duplicate copies")
+    def post_fix_names(req: FixNamesRequest):
+        """Applies what /check-names suggests (only for `names` when given). Renaming moves every
+        file of the model and updates its name in the prompts of its added examples and card;
+        merging moves the added examples into the copy that stays and deletes the other copy.
+        `mapping` lists the old -> new names prompts should use; refresh the WebUI's model list
+        afterwards (POST /sdapi/v1/refresh-loras for LoRAs)."""
+        types = _normalize_types(req.model_types or ["lora"])
+
+        def do_rename(model_type, path, new_stem):
+            return rename_model(model_type, path, new_stem)
+
+        out = naming.fix(types, req.names, req.merge, rename_model=do_rename)
+        out["refresh"] = sorted({_REFRESH_ENDPOINTS.get(t) for t in types if _REFRESH_ENDPOINTS.get(t)})
+        util.printD(f"fix-names {types}: {len(out['results'])} fixed, {len(out['skipped'])} skipped, mapping {out['mapping']}")
+        return out
 
     @router.get("/model-info", summary="Look up a model on civitai by id or page URL")
     def get_remote_model_info(url_or_id: str = Query(..., description="civitai model id or model page URL")):
@@ -908,6 +1114,8 @@ def build_router() -> APIRouter:
 
     @router.post("/download", summary="Download a model version from civitai into the matching model folder")
     def post_download(req: DownloadRequest):
+        if req.on_conflict not in ("version", "error"):
+            raise HTTPException(400, "on_conflict must be 'version' or 'error'")
         ch_settings.load()
         r = _fetch_remote_model(req.url_or_id)
         info, model_type = r["info"], r["model_type"]
@@ -926,25 +1134,32 @@ def build_router() -> APIRouter:
 
         def run():
             s = ch_settings.load()
+            report: dict = {}
             output = model_action_civitai.dl_model_by_input(
                 info, model_type, subfolder, version_str, req.dl_all,
-                s["max_size_preview"], s["skip_nsfw_preview"],
+                s["max_size_preview"], s["skip_nsfw_preview"], on_conflict=req.on_conflict, result=report,
             )
             output = str(output or "")
-            already = "already existed" in output
-            ok = output.startswith("Done") or output.startswith("Model downloaded")
-            if not (ok or already):
+            status = report.get("status")
+            if status not in ("done", "exists", "conflict"):
                 raise RuntimeError(output or "download failed; check the WebUI console log")
-            file_path = None
-            for marker in ("Model downloaded to: ", "Model saved to: "):
-                if marker in output:
-                    file_path = output.split(marker, 1)[1].strip()
-                    break
+            folder = model.folders.get(model_type, "")
+            rel = lambda q: util.get_relative_path(q, folder).replace("\\", "/") if q else None
+            file_path = report.get("file")
+            stem = os.path.splitext(os.path.basename(file_path))[0] if file_path else None
+            tag = {"lora": f"<lora:{stem}:1>", "hyper": f"<hypernet:{stem}:1>", "ti": stem}.get(model_type) if stem else None
             return {
                 **params,
-                "ok": ok,
-                "already_exists": already,
+                "ok": status == "done",
+                "status": status,
+                "already_exists": status == "exists",
+                "existing": [rel(p) for p in report.get("existing") or []],
                 "file": file_path,
+                "name": rel(file_path),
+                "civitai_file_name": report.get("civitai_file_name"),
+                "renamed": bool(report.get("renamed")),
+                "suggested_name": report.get("suggested"),
+                "prompt_tag": tag,
                 "trained_words": version.get("trainedWords") or [],
                 "message": output,
             }

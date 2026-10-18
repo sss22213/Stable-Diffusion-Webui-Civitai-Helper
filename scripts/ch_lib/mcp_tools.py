@@ -150,7 +150,7 @@ TOOLS = json.loads(r"""
   },
   {
     "name": "civitai_model_examples",
-    "description": "The civitai EXAMPLE images of ONE installed model, each with its generation parameters: prompt, negative_prompt, steps, sampler, cfg_scale, seed, size, model (checkpoint used), nsfw flag, the civitai image url, and local_file / local_url when the image was saved locally with civitai_download_examples. Also returns trained_words, base_model, downloaded/total counts, has_preview and has_card_info. Use it when the user asks for example prompts, sample images, 'how do I use this LoRA', 'show me what it looks like', or wants a proven prompt to start from.",
+    "description": "The civitai EXAMPLE images of ONE installed model, each with its generation parameters: prompt, negative_prompt, steps, sampler, cfg_scale, seed, size, model (checkpoint used), nsfw flag, the civitai image url, and local_file / local_url when the image was saved locally with civitai_download_examples; images added with civitai_add_user_examples (source user, with username) and civitai_add_local_examples (source local, the user's own pictures) follow from #101. Also returns trained_words, base_model, downloaded/total/user_images/local_images counts, has_preview and has_card_info. Use it when the user asks for example prompts, sample images, 'how do I use this LoRA', 'show me what it looks like', or wants a proven prompt to start from.",
     "method": "GET",
     "path": "/models/{type}/examples",
     "parameters": {
@@ -197,7 +197,7 @@ TOOLS = json.loads(r"""
   },
   {
     "name": "civitai_download_model",
-    "description": "Download a civitai model version into the WebUI's model folder for its type (LoRA, checkpoint, embedding or hypernetwork), then save its civitai info file and preview image. Defaults to the newest version and the folder root. The call waits up to ~9 minutes; larger checkpoints may still be running afterwards.",
+    "description": "Download a civitai model version into the WebUI's model folder for its type (LoRA, checkpoint, embedding or hypernetwork), then save its civitai info file and preview image. Defaults to the newest version and the folder root. A version that is already installed (under any name or subfolder) is not downloaded again: status 'exists' with its file in existing. The file gets civitai's file name; when another model already uses it, it is saved as name_<version> (renamed true) or, with on_conflict 'error', nothing is downloaded (status 'conflict'). Tell the user the file name (name) and prompt_tag that were used. The call waits up to ~9 minutes; larger checkpoints may still be running afterwards.",
     "method": "POST",
     "path": "/download",
     "parameters": {
@@ -226,6 +226,14 @@ TOOLS = json.loads(r"""
         "dl_all": {
           "type": "boolean",
           "description": "Download every file of the version instead of only the primary one"
+        },
+        "on_conflict": {
+          "type": "string",
+          "enum": [
+            "version",
+            "error"
+          ],
+          "description": "When another model already uses civitai's file name: 'version' (default) saves it as name_<version>; 'error' downloads nothing so you can ask the user for a name"
         }
       },
       "required": [
@@ -484,7 +492,7 @@ TOOLS = json.loads(r"""
   },
   {
     "name": "civitai_remove_user_examples",
-    "description": "Delete example images that were added from civitai users (numbers 101 and up) from ONE installed model: by civitai image id, by example number, or all of them. Does not touch the civitai example list (#1-#100).",
+    "description": "Delete example images that were added (numbers 101 and up: images from civitai users or local images) from ONE installed model: by civitai image id, by example number, or all of them (source narrows 'all' to 'user' or 'local'). Does not touch the civitai example list (#1-#100).",
     "method": "POST",
     "path": "/remove-user-examples",
     "parameters": {
@@ -520,7 +528,15 @@ TOOLS = json.loads(r"""
         },
         "all": {
           "type": "boolean",
-          "description": "Remove every user-added example of this model"
+          "description": "Remove every added example (#101+) of this model"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "user",
+            "local"
+          ],
+          "description": "With all: only images from civitai users (user) or only local images (local)"
         }
       },
       "required": [
@@ -582,7 +598,7 @@ TOOLS = json.loads(r"""
   },
   {
     "name": "civitai_rename_model",
-    "description": "Rename ONE installed model (LoRA, checkpoint, embedding or hypernetwork) together with every file that belongs to it — civitai info, previews, card metadata (.json), example images — inside its own folder; it can also change the model file's extension (.safetensors / .ckpt / .pt / .bin). Changing the extension only renames the file, it does NOT convert it. Nothing is renamed when a target file already exists or another model of the same type already has the new name, and a failure half way is rolled back. Only call it when the user explicitly asks to rename a model or change its extension. The WebUI sees the new name only after its list is refreshed (refresh_loras / refresh_checkpoints / refresh_embeddings), and prompts that used the old <lora:old_name:...> tag must then use the new one.",
+    "description": "Rename ONE installed model (LoRA, checkpoint, embedding or hypernetwork) together with every file that belongs to it — civitai info, previews, card metadata (.json), example images — inside its own folder; it can also change the model file's extension (.safetensors / .ckpt / .pt / .bin). Changing the extension only renames the file, it does NOT convert it. Nothing is renamed when a target file already exists or another model of the same type already has the new name, and a failure half way is rolled back. Only call it when the user explicitly asks to rename a model or change its extension. The WebUI sees the new name only after its list is refreshed (refresh_loras / refresh_checkpoints / refresh_embeddings), and prompts that used the old <lora:old_name:...> tag must then use the new one. Its name in the prompts of its own added examples and card text is updated automatically.",
     "method": "POST",
     "path": "/rename-model",
     "parameters": {
@@ -659,6 +675,71 @@ TOOLS += [
         "parameters": {"type": "object", "properties": {}},
     },
     {
+        "name": "civitai_add_local_examples",
+        "description": "Save a locally generated image as an example image of installed models (LoRA by default), next to the model file as <model>.example_NNN.<ext> (numbers from 101, shared with images added from civitai users). The file is kept as it is; its prompt and parameters are read from the image's generation info (or given here for images without it) and are shown by civitai_model_examples and written to the card by civitai_write_card_info. Without name the image goes to every installed LoRA in its prompt (<lora:name:w>), or with type ckp to its checkpoint. Give the image as base64 / data URL (image), as a file in the WebUI's output folders (path), or several in images. The same picture added again keeps its number. Use it when the user wants to keep a picture they made as an example / sample image of a LoRA.",
+        "method": "POST",
+        "path": "/add-local-examples",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["lora", "ckp", "ti", "hyper"], "description": "Model type (default lora)"},
+                "name": {"type": "string", "description": "File name (e.g. foo.safetensors) or path relative to the model folder. Leave empty to use every LoRA in the image's prompt."},
+                "image": {"type": "string", "description": "The image as base64 or a data: URL (PNG / JPEG / WebP)."},
+                "path": {"type": "string", "description": "Instead of image: an image file in the WebUI's output folders, e.g. output/txt2img-images/2026-10-18/00012-123.png"},
+                "file_name": {"type": "string", "description": "Original file name, kept for reference."},
+                "prompt": {"type": "string", "description": "Prompt to store when the image has no generation info (otherwise it is read from the image)."},
+                "negative_prompt": {"type": "string"},
+                "steps": {"type": "integer"},
+                "sampler": {"type": "string"},
+                "cfg_scale": {"type": "number"},
+                "seed": {"type": "integer"},
+                "model": {"type": "string", "description": "Checkpoint name"},
+                "nsfw": {"type": "boolean", "description": "Mark the image as NSFW."},
+                "images": {
+                    "type": "array",
+                    "description": "Several images, each {data or path, file_name, prompt, negative_prompt, nsfw ...}; the top-level prompt / parameters only fill what an image's own generation info lacks.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "data": {"type": "string"}, "path": {"type": "string"}, "file_name": {"type": "string"},
+                            "prompt": {"type": "string"}, "negative_prompt": {"type": "string"}, "nsfw": {"type": "boolean"},
+                        },
+                    },
+                },
+                "overwrite": {"type": "boolean", "description": "Re-save an image that was added before and refresh its prompt."},
+            },
+        },
+        "defaults": {"type": "lora"},
+        "timeout": 120,
+    },
+    {
+        "name": "civitai_check_names",
+        "description": "Find installed models whose file name is civitai's file name plus a _2 / _3 suffix (left by downloading a version twice, or a new version saved next to the old one) and duplicate copies of the same civitai version. Each item says what civitai_fix_names would do: rename (back to civitai's name), merge (into another copy of the same version, which keeps the added example images) or conflict (needs the user's decision). Read-only.",
+        "method": "GET",
+        "path": "/check-names",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "model_types": {"type": "array", "items": {"type": "string", "enum": ["lora", "ckp", "ti", "hyper"]}, "description": "Model types to check (default lora)"},
+            },
+        },
+    },
+    {
+        "name": "civitai_fix_names",
+        "description": "Apply what civitai_check_names suggests: rename _2 / _3 models back to civitai's file name (every file of the model moves; its name in the prompts of its added examples and card is updated) and merge duplicate copies of one version (their added example images move to the copy that stays, the other copy is DELETED). Show the user the check result and get an OK first. Returns mapping = old name -> new name, so prompts with <lora:old:...> can be updated; refresh the model list afterwards (refresh_loras).",
+        "method": "POST",
+        "path": "/fix-names",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "model_types": {"type": "array", "items": {"type": "string", "enum": ["lora", "ckp", "ti", "hyper"]}, "description": "Model types (default lora)"},
+                "names": {"type": "array", "items": {"type": "string"}, "description": "Only these models (name from civitai_check_names); default every suggestion"},
+                "merge": {"type": "boolean", "description": "Also merge duplicate copies (default true); false = only renames"},
+            },
+        },
+        "timeout": 300,
+    },
+    {
         "name": "civitai_delete_model",
         "description": "Delete one local model for good together with every file that belongs to it (info files, previews, card metadata, example images), like the trash button on its card. Refresh the WebUI's model list afterwards. Only do this when the user explicitly asks to delete that model.",
         "method": "POST",
@@ -718,11 +799,11 @@ TOOLS += [
         "defaults": {"limit": 12, "nsfw": "X"},
     },
 ]
-_DESTRUCTIVE = {"civitai_delete_model"}
+_DESTRUCTIVE = {"civitai_delete_model", "civitai_fix_names"}
 
 _READ_ONLY = {"civitai_lora_inventory", "civitai_list_local_models", "civitai_local_model_info",
               "civitai_model_examples", "civitai_lookup_model", "civitai_task_status", "civitai_model_types",
-              "civitai_search_models", "civitai_search_images"}
+              "civitai_search_models", "civitai_search_images", "civitai_check_names"}
 _app: Any = None
 
 

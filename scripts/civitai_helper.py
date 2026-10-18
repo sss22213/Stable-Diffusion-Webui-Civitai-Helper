@@ -133,6 +133,91 @@ def on_ui_tabs():
             model_types, None, int(max_images or 0), s["skip_nsfw_preview"], overwrite, s["max_size_preview"]))
 
 
+    # ---- local images as examples (same helper as POST /add-local-examples) ----
+    def _local_model_choices(model_type):
+        from scripts.ch_lib import local_models
+        return [util.get_relative_path(path, folder).replace("\\", "/")
+                for folder, _root, path, _filename in local_models.iter_models(model_type)]
+
+    def local_example_type_changed(model_type):
+        return gr.update(choices=_local_model_choices(model_type), value=[])
+
+    def local_example_files_changed(files, model_type, current):
+        """Pick the models the uploaded images were made with (LoRAs in the prompt / the checkpoint)."""
+        picked = list(current or [])
+        info = []
+        for f in files or []:
+            fp = f if isinstance(f, str) else getattr(f, "name", "")
+            try:
+                with open(fp, "rb") as fh:
+                    meta = examples.read_image_info(fh.read())["meta"]
+            except (OSError, ValueError) as e:
+                info.append(f"{os.path.basename(fp)}: {e}")
+                continue
+            names = examples.models_in_image(model_type, meta)
+            picked += [n for n in names if n not in picked]
+            info.append(f"{os.path.basename(fp)}: " + ("prompt found" if meta.get("prompt") else "no generation info")
+                        + (f", models: {', '.join(names)}" if names else ""))
+        return gr.update(value=picked), "<br>".join(info)
+
+    def add_local_examples(files, model_type, model_names, nsfw):
+        from scripts.ch_lib import local_models
+        if not files:
+            return "Add one or more images first"
+        if not model_names:
+            return "Pick the model(s) the images should be examples of"
+        images = []
+        for f in files:
+            fp = f if isinstance(f, str) else getattr(f, "name", "")
+            with open(fp, "rb") as fh:
+                images.append({"data": fh.read(), "file_name": os.path.basename(fp), "nsfw": bool(nsfw)})
+        lines = []
+        for name in model_names:
+            found = local_models.find(model_type, name)
+            if not found:
+                lines.append(f"**{name}**: not found")
+                continue
+            r = examples.add_local_examples(found[2], images)
+            numbers = ", ".join(f"#{i['index']}" for i in r["images"] if i.get("index"))
+            errors = "; ".join(f"{i.get('file_name')}: {i.get('error')}" for i in r["images"] if i.get("status") == "failed")
+            lines.append(f"**{name}**: {r['added']} added, {r['existed']} already there"
+                         + (f" ({numbers})" if numbers else "") + (f", failed: {errors}" if errors else ""))
+        return "<br>".join(lines) + "<br>Open the model's examples (or run Write Example Prompt to Cards) to see them."
+
+    # ---- file names vs civitai (same helpers as GET /check-names, POST /fix-names) ----
+    _ACTION_LABEL = {"rename": "rename to", "merge": "merge into", "conflict": "check by hand"}
+
+    def check_names(model_types):
+        from scripts.ch_lib import naming
+        if not model_types:
+            return "Model Types is empty"
+        r = naming.scan(model_types)
+        if not r["items"]:
+            return "All file names match civitai's (no _2 / _3 copies, no duplicate versions)."
+        rows = ["| Model | Civitai file | Action | Target | Why |", "|---|---|---|---|---|"]
+        for it in r["items"]:
+            rows.append(f"| {it['type']}: `{it['name']}` | `{it['civitai_file']}` | {_ACTION_LABEL[it['action']]} | "
+                        f"`{it['target']}` | {it['reason']}" + (f"; {it['added_examples']} added examples" if it["added_examples"] else "") + " |")
+        c = r["counts"]
+        return (f"{c['rename']} to rename, {c['merge']} duplicate copies to merge, {c['conflict']} to check by hand.\n\n"
+                + "\n".join(rows))
+
+    def fix_names(model_types, merge):
+        from scripts.ch_lib import naming
+        if not model_types:
+            return "Model Types is empty"
+        r = naming.fix(model_types, None, bool(merge), rename_model=lambda t, path, new: ch_api.rename_model(t, path, new))
+        lines = [f"**{len(r['results'])} fixed**, {len(r['skipped'])} skipped."]
+        for it in r["results"]:
+            lines.append(f"- {it['type']}: `{it['name']}` → {_ACTION_LABEL[it['action']]} `{it['target']}`")
+        for it in r["skipped"]:
+            lines.append(f"- skipped `{it['name']}`: {it['reason']}")
+        if r["mapping"]:
+            lines.append("Prompts that use the old names need the new ones: "
+                         + ", ".join(f"`{a}` → `{b}`" for a, b in r["mapping"].items())
+                         + ". Click Refresh in the Extra Networks tab.")
+        return "<br>".join(lines)
+
     def get_model_names_by_input(model_type, empty_info_only):
         names = civitai.get_model_names_by_input(model_type, empty_info_only)
         # Component.update(...) in Gradio 4.x returns the component itself
@@ -244,6 +329,32 @@ def on_ui_tabs():
 
         with gr.Box(elem_classes="ch_box"):
             with gr.Column():
+                gr.Markdown("### Add Local Images as Examples")
+                gr.Markdown("Keep pictures you generated as example images of a model (`<model>.example_101+.<ext>`, the file is kept as it is). The prompt and parameters are read from the image's generation info; the LoRAs in its prompt are picked automatically. Also available as `POST /civitai-helper/v1/add-local-examples` and the MCP tool `civitai_add_local_examples`.")
+                with gr.Row():
+                    lx_files = gr.File(label="Images (PNG / JPEG / WebP)", file_count="multiple", file_types=["image"], type="filepath")
+                    with gr.Column():
+                        lx_type_drop = gr.Dropdown(choices=model_types, label="Model Type", value="lora", multiselect=False)
+                        lx_models_drop = gr.Dropdown(choices=_local_model_choices("lora"), label="Models", value=[], multiselect=True, interactive=True)
+                        lx_nsfw_ckb = gr.Checkbox(label="Mark as NSFW", value=False)
+                lx_info_md = gr.Markdown("")
+                lx_add_btn = gr.Button(value="Add as Example Images", variant="primary")
+                lx_log_md = gr.Markdown("")
+
+        with gr.Box(elem_classes="ch_box"):
+            with gr.Column():
+                gr.Markdown("### Check Model File Names")
+                gr.Markdown("Finds models whose file name is civitai's name plus `_2` / `_3` (a version downloaded twice, or a new version saved next to the old one) and duplicate copies of the same version. Fixing renames them back (every file moves along, the model's name in its example prompts is updated) and merges duplicates into one copy (added example images move over, the other copy is deleted). Also `GET /check-names`, `POST /fix-names`.")
+                with gr.Row():
+                    nm_types_ckbg = gr.CheckboxGroup(choices=model_types, label="Model Types", value=["lora"])
+                    nm_merge_ckb = gr.Checkbox(label="Also merge duplicate copies (deletes the extra copy)", value=True, elem_classes="ch_vpadding")
+                with gr.Row():
+                    nm_check_btn = gr.Button(value="Check File Names", variant="primary")
+                    nm_fix_btn = gr.Button(value="Fix File Names")
+                nm_log_md = gr.Markdown("")
+
+        with gr.Box(elem_classes="ch_box"):
+            with gr.Column():
                 gr.Markdown("### Other")
                 # save_setting_btn = gr.Button(value="Save Setting")
                 gr.Markdown(value="Settings are moved into Settings Tab->Civitai Helper section")
@@ -283,6 +394,15 @@ def on_ui_tabs():
         ex_fetch_previews_btn.click(fetch_previews, inputs=[ex_model_types_ckbg], outputs=ex_fetch_previews_log_md)
         ex_write_card_info_btn.click(write_card_info, inputs=[ex_model_types_ckbg, ex_card_overwrite_ckb], outputs=ex_write_card_info_log_md)
         ex_download_examples_btn.click(download_examples, inputs=[ex_model_types_ckbg, ex_max_images_num, ex_dl_overwrite_ckb], outputs=ex_download_examples_log_md)
+
+        # File names
+        nm_check_btn.click(check_names, inputs=[nm_types_ckbg], outputs=nm_log_md)
+        nm_fix_btn.click(fix_names, inputs=[nm_types_ckbg, nm_merge_ckb], outputs=nm_log_md)
+
+        # Local images as examples
+        lx_type_drop.change(local_example_type_changed, inputs=[lx_type_drop], outputs=lx_models_drop)
+        lx_files.change(local_example_files_changed, inputs=[lx_files, lx_type_drop, lx_models_drop], outputs=[lx_models_drop, lx_info_md])
+        lx_add_btn.click(add_local_examples, inputs=[lx_files, lx_type_drop, lx_models_drop, lx_nsfw_ckb], outputs=lx_log_md)
 
         # js action
         js_open_url_btn.click(open_model_url, inputs=[js_msg_txtbox], outputs=py_msg_txtbox)

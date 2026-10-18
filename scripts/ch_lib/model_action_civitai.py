@@ -6,6 +6,7 @@ from . import util
 from . import model
 from . import civitai
 from . import downloader
+from . import naming
 
 
 # scan model to generate SHA256, then use this SHA256 to get model info from civitai
@@ -380,9 +381,17 @@ def get_id_and_dl_url_by_version_str(version_str:str, model_info:dict) -> tuple:
 
 # download model from civitai by input
 # output to markdown log
-def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, version_str:str, dl_all_bool:bool, max_size_preview:bool, skip_nsfw_preview:bool) -> str:
+def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, version_str:str, dl_all_bool:bool, max_size_preview:bool, skip_nsfw_preview:bool,
+                      on_conflict:str="version", result:dict=None) -> str:
+    """Download one civitai version. A version that is already somewhere in the model type's folders
+    is not downloaded again. The file gets civitai's file name; when another model already has that
+    name it gets the name plus the version ("name_v2.0"), or with on_conflict="error" nothing is
+    downloaded. `result` (optional dict) is filled with status ("done" | "exists" | "conflict" |
+    "failed"), file, civitai_file_name, renamed, existing."""
 
     output = ""
+    report = result if result is not None else {}
+    report["status"] = "failed"
 
     if not model_info:
         output = "model_info is None"
@@ -437,6 +446,41 @@ def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, versio
         return output
     
     version_id = ver_info["id"]
+    report["version_id"] = version_id
+
+    # already downloaded (anywhere under this model type's folders, under any name)?
+    copies = naming.existing_copies(model_type, version_id)
+    if copies:
+        paths = [c[2] for c in copies]
+        report.update(status="exists", existing=paths, file=paths[0])
+        output = "This model version is already existed: " + ", ".join(paths)
+        util.printD(output)
+        return output
+
+    # where the model file goes: civitai's file name, or the name plus the version when it is taken
+    file_info = naming.model_file_of_version(ver_info)
+    civitai_name = (file_info or {}).get("name") or ""
+    report["civitai_file_name"] = civitai_name
+    dl_path = None
+    if civitai_name:
+        same_path = os.path.join(model_folder, civitai_name)
+        if naming.same_file(same_path, file_info):
+            # the very same file is already there, only without civitai info: add the info instead
+            model.write_model_info(os.path.splitext(same_path)[0] + civitai.suffix + model.info_ext, ver_info)
+            civitai.get_preview_image_by_model_path(same_path, max_size_preview, skip_nsfw_preview)
+            report.update(status="exists", existing=[same_path], file=same_path)
+            output = "This model version is already existed: " + same_path + " (same file, civitai info added)"
+            util.printD(output)
+            return output
+        picked = naming.pick_download_name(model_type, model_folder, ver_info, file_info)
+        if picked and picked[1] and on_conflict == "error":
+            report.update(status="conflict", suggested=picked[0])
+            output = (f"Name conflict: another model already uses the name {civitai_name}; nothing was downloaded "
+                      f"(it could be saved as {picked[0]})")
+            util.printD(output)
+            return output
+        if picked:
+            dl_path = os.path.join(model_folder, picked[0])
 
 
     if dl_all_bool:
@@ -453,17 +497,10 @@ def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, versio
                 download_urls.append(ver_info["downloadUrl"])
 
 
-        # check if this model is already existed
-        r = civitai.search_local_model_info_by_version_id(model_folder, version_id, False)
-        if r:
-            output = "This model version is already existed"
-            util.printD(output)
-            return output
-        
         # download
         filepath = ""
         for url in download_urls:
-            model_filepath = downloader.dl(url, model_folder, None, None)
+            model_filepath = downloader.dl(url, model_folder, None, dl_path if url == ver_info.get("downloadUrl") else None)
             if not model_filepath:
                 output = "Downloading failed, check console log for detail"
                 util.printD(output)
@@ -481,7 +518,7 @@ def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, versio
             return output
         
         # download
-        filepath = downloader.dl(url, model_folder, None, None)
+        filepath = downloader.dl(url, model_folder, None, dl_path)
         if not filepath:
             output = "Downloading failed, check console log for detail"
             util.printD(output)
@@ -490,11 +527,16 @@ def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, versio
 
     if not filepath:
         filepath = model_filepath
-    
+
+    renamed = bool(civitai_name) and os.path.basename(filepath) != civitai_name
+    report.update(status="done", file=filepath, renamed=renamed)
+    note = (f" (another model already uses civitai's file name {civitai_name}, so it was saved as "
+            f"{os.path.basename(filepath)})") if renamed else ""
+
     # get version info
     version_info = civitai.get_version_info_by_version_id(version_id)
     if not version_info:
-        output = "Model downloaded, but failed to get version info, check console log for detail. Model saved to: " + filepath
+        output = "Model downloaded, but failed to get version info, check console log for detail. Model saved to: " + filepath + note
         util.printD(output)
         return output
 
@@ -506,6 +548,6 @@ def dl_model_by_input(model_info:dict, model_type:str, subfolder_str:str, versio
     # then, get preview image
     civitai.get_preview_image_by_model_path(filepath, max_size_preview, skip_nsfw_preview)
     
-    output = "Done. Model downloaded to: " + filepath
+    output = "Done. Model downloaded to: " + filepath + note
     util.printD(output)
     return output

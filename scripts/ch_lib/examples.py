@@ -21,16 +21,23 @@ card preview. This module makes the rest usable:
                         LoRA") as extra examples `<model>.example_101.<ext>`…
                         Their prompts live in the sidecar `<model>.examples.json`
                         because they are not part of the civitai info file.
+* add_local_examples()  save images generated locally (PNG / JPEG / WebP, with the
+                        WebUI's generation info) as extra examples the same way;
+                        their sidecar entries have "source": "local".
 
-Numbering: 1-100 = position in the civitai info list, 101-999 = user images.
+Numbering: 1-100 = position in the civitai info list, 101-999 = images added
+from civitai users or from local files (one shared range).
 
 All three "run_*" helpers below take a list of model types (ti / hyper /
 ckp / lora) or one (type, path) pair, and are shared by the Gradio buttons
 and the HTTP API (see api.py).
 """
+import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import time
 from urllib.parse import quote, urlparse
 
@@ -44,6 +51,8 @@ EXAMPLE_TAG = ".example_"
 USER_BASE = 101              # first index used for user-posted example images
 USER_MAX = 999
 USER_SIDECAR = ".examples.json"
+LOCAL_SOURCE = "local"         # sidecar entries of locally generated images
+LOCAL_MAX_BYTES = 30 * 1024 * 1024
 EXAMPLE_RE = re.compile(r"\.example_(\d{2,3})\.(png|jpe?g|webp|gif)$", re.IGNORECASE)
 IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif")
 DESC_PROMPT_LIMIT = 600      # card description: chars of example prompt kept
@@ -258,6 +267,7 @@ def list_examples(model_type: str, folder: str, path: str) -> dict:
         "downloaded": len(local),
         "total": len(images),
         "user_images": sum(1 for v in images if v.get("source") == "user"),
+        "local_images": sum(1 for v in images if v.get("source") == LOCAL_SOURCE),
         "images": images,
     }
 
@@ -332,13 +342,22 @@ def used_loras(meta: dict) -> list:
 
 
 def user_image_view(entry: dict) -> dict:
-    """Same shape as image_view(), plus who posted it and where."""
+    """Same shape as image_view(), plus who posted it and where (or, for a local image,
+    its original file name)."""
     meta = entry.get("meta") or {}
     v = image_view(entry["index"], {
         "url": entry.get("url"), "type": "image", "width": entry.get("width"), "height": entry.get("height"),
         "nsfwLevel": entry.get("nsfw_level"), "meta": meta,
     })
     v["nsfw"] = bool(entry.get("nsfw"))
+    if entry.get("source") == LOCAL_SOURCE:
+        v.update({
+            "source": LOCAL_SOURCE,
+            "file_name": entry.get("file_name"),
+            "loras": used_loras(meta),
+            "added_at": entry.get("added_at"),
+        })
+        return v
     v.update({
         "source": "user",
         "image_id": entry.get("id"),
@@ -360,7 +379,8 @@ def add_user_examples(path: str, images: list, skip_nsfw: bool = False, overwrit
     r = {"path": path, "status": "ok", "added": 0, "existed": 0, "skipped_nsfw": 0, "skipped_video": 0,
          "in_civitai_list": 0, "failed": 0, "images": []}
     entries = load_user_examples(path)
-    by_id = {e.get("id"): e for e in entries}
+    others = [e for e in entries if e.get("id") is None]   # local images: no civitai id, kept as they are
+    by_id = {e.get("id"): e for e in entries if e.get("id") is not None}
     info = load_info(path)
     info_keys = {image_key(img.get("url")): i for i, img in info_images(info)} if info else {}
     used = {e["index"] for e in entries} | {i for i in (example_index_of(p) for p in example_files(path)) if i}
@@ -418,29 +438,326 @@ def add_user_examples(path: str, images: list, skip_nsfw: bool = False, overwrit
             next_index += 1
         by_id[iid] = entry
         r["images"].append({**row, "index": entry["index"], "status": status})
-    _save_user_examples(path, list(by_id.values()))
+    _save_user_examples(path, others + list(by_id.values()))
     if r["failed"] and not (r["added"] or r["existed"]) and r["status"] == "ok":
         r["status"] = "failed"
     r["total_user_examples"] = len(by_id)
     return r
 
 
-def remove_user_examples(path: str, image_ids=None, indexes=None, remove_all: bool = False) -> dict:
-    """Delete user example images (files + sidecar entries) by civitai image id or example number."""
+def remove_user_examples(path: str, image_ids=None, indexes=None, remove_all: bool = False,
+                         source: str = None) -> dict:
+    """Delete added example images (files + sidecar entries) by civitai image id or example
+    number; remove_all takes every added one, or only those of `source` ("user" = from civitai
+    users, "local" = local images)."""
     entries = load_user_examples(path)
     ids = {int(i) for i in image_ids or []}
     idx = {int(i) for i in indexes or []}
     keep, removed = [], []
     for e in entries:
-        if remove_all or e.get("id") in ids or e["index"] in idx:
+        kind = e.get("source") or "user"
+        if (remove_all and source in (None, "", kind)) or (e.get("id") is not None and e.get("id") in ids) \
+                or e["index"] in idx:
             for p in example_files(path):
                 if example_index_of(p) == e["index"]:
                     os.remove(p)
-            removed.append({"index": e["index"], "image_id": e.get("id")})
+            removed.append({"index": e["index"], "image_id": e.get("id"), "source": kind})
         else:
             keep.append(e)
     _save_user_examples(path, keep)
     return {"path": path, "removed": removed, "remaining": len(keep)}
+
+
+# ---------------------------------------------------------------------------
+# locally generated images as extra examples (same numbering and sidecar)
+# ---------------------------------------------------------------------------
+
+_LORA_IN_PROMPT_RE = re.compile(r"<(?:lora|lyco):([^:>]+)(?::([^:>]*))?[^>]*>", re.IGNORECASE)
+# key: value pairs of the WebUI's parameters line (same pattern as modules/infotext_utils.py)
+_PARAM_RE = re.compile(r'\s*(\w[\w \-/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)')
+_FORMAT_EXT = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp", "GIF": "gif"}
+
+
+def _parse_infotext(text: str) -> dict:
+    """WebUI generation info text -> {"Prompt", "Negative prompt", "Steps", ...}. Uses the WebUI's own
+    parser when it is there (inside Forge), else a small copy of it."""
+    try:
+        from modules import infotext_utils
+        return infotext_utils.parse_generation_parameters(text)
+    except Exception:
+        pass
+    lines = text.strip().split("\n")
+    last = lines[-1] if len(_PARAM_RE.findall(lines[-1])) >= 3 else ""
+    if last:
+        lines = lines[:-1]
+    prompt, negative, in_negative = [], [], False
+    for line in lines:
+        if line.startswith("Negative prompt:"):
+            in_negative, line = True, line[len("Negative prompt:"):]
+        (negative if in_negative else prompt).append(line.strip())
+    out = {"Prompt": "\n".join(prompt).strip(), "Negative prompt": "\n".join(negative).strip()}
+    for k, v in _PARAM_RE.findall(last):
+        v = v.strip()
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        out[k.strip()] = v
+    size = re.match(r"^(\d+)x(\d+)$", str(out.get("Size") or ""))
+    if size:
+        out["Size-1"], out["Size-2"] = size.group(1), size.group(2)
+    return out
+
+
+def read_image_info(data: bytes) -> dict:
+    """Generation info of an image file: {"format", "width", "height", "infotext", "meta"}; meta uses
+    the civitai keys (prompt, negativePrompt, steps, sampler, cfgScale, seed, Size, clipSkip, Model,
+    resources = the LoRAs of the prompt). Raises ValueError when it is not an image."""
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception:
+        raise ValueError("not a readable image file")
+    text = None
+    try:
+        from modules import images as webui_images
+        text, _ = webui_images.read_info_from_image(img)
+    except Exception:
+        text = img.info.get("parameters")
+    text = text if isinstance(text, str) else None
+    params = _parse_infotext(text) if text else {}
+    meta = {}
+    for key, src in (("prompt", "Prompt"), ("negativePrompt", "Negative prompt"), ("sampler", "Sampler"),
+                     ("Model", "Model")):
+        if params.get(src):
+            meta[key] = str(params[src])
+    for key, src in (("steps", "Steps"), ("cfgScale", "CFG scale"), ("seed", "Seed"), ("clipSkip", "Clip skip")):
+        if params.get(src) not in (None, ""):
+            meta[key] = _num(params[src])
+    if params.get("Size-1") and params.get("Size-2"):
+        meta["Size"] = f"{params['Size-1']}x{params['Size-2']}"
+    loras = [{"type": "lora", "name": m.group(1).strip(), "weight": _num(m.group(2)) if m.group(2) else 1}
+             for m in _LORA_IN_PROMPT_RE.finditer(meta.get("prompt") or "")]
+    if loras:
+        meta["resources"] = loras
+    return {"format": _FORMAT_EXT.get(img.format or "", ""), "width": img.width, "height": img.height,
+            "infotext": text or "", "meta": meta}
+
+
+def models_in_image(model_type: str, meta: dict) -> list:
+    """Local models an image was made with, as paths relative to the model folder: the LoRAs of
+    its prompt (<lora:name:w>, matched by file name without extension) or its checkpoint (Model)."""
+    if model_type == "lora":
+        wanted = [r["name"] for r in meta.get("resources") or [] if r.get("type") == "lora"]
+    elif model_type == "ckp":
+        wanted = [meta["Model"]] if meta.get("Model") else []
+    else:
+        return []
+    keys = {w.strip().casefold(): w for w in wanted if w and w.strip()}
+    found = {}
+    for folder, _root, path, filename in local_models.iter_models(model_type):
+        stem = os.path.splitext(filename)[0].casefold()
+        if stem in keys and stem not in found:
+            found[stem] = util.get_relative_path(path, folder).replace("\\", "/")
+    return [found[k] for k in keys if k in found]
+
+
+def _apply_overrides(meta: dict, overrides: dict) -> dict:
+    """Values the caller gave (prompt, negative_prompt, steps, ...) win over the image's own info."""
+    meta = dict(meta)
+    for key, src in (("prompt", "prompt"), ("negativePrompt", "negative_prompt"), ("sampler", "sampler"),
+                     ("Model", "model")):
+        if (overrides.get(src) or "").strip():
+            meta[key] = overrides[src].strip()
+    for key, src in (("steps", "steps"), ("cfgScale", "cfg_scale"), ("seed", "seed"), ("clipSkip", "clip_skip")):
+        if overrides.get(src) is not None:
+            meta[key] = _num(overrides[src])
+    if overrides.get("prompt"):
+        loras = [{"type": "lora", "name": m.group(1).strip(), "weight": _num(m.group(2)) if m.group(2) else 1}
+                 for m in _LORA_IN_PROMPT_RE.finditer(meta["prompt"])]
+        meta.pop("resources", None)
+        if loras:
+            meta["resources"] = loras
+    return meta
+
+
+def effective_meta(meta: dict, img: dict) -> dict:
+    """The image's own info, with the caller's values for this image on top (img["prompt"] ...)
+    and img["defaults"] (values given for several images at once) only where it has none."""
+    meta = _apply_overrides(meta, img)
+    for key, value in _apply_overrides({}, img.get("defaults") or {}).items():
+        meta.setdefault(key, value)
+    return meta
+
+
+def add_local_examples(path: str, images: list, overwrite: bool = False) -> dict:
+    """Save locally generated images as extra examples of the model at `path`.
+
+    images: [{"data": bytes, "file_name": str, "nsfw": bool, and optional overrides prompt /
+    negative_prompt / steps / sampler / cfg_scale / seed / clip_skip / model, plus "defaults" with
+    the same keys that only fill what the image's own info lacks}]. The file is kept
+    byte for byte (its generation info stays inside); the prompt and parameters read from it go
+    into the sidecar like those of civitai user images. The same picture added again keeps its
+    number (overwrite=True refreshes its prompt / flags)."""
+    r = {"path": path, "status": "ok", "added": 0, "existed": 0, "failed": 0, "images": []}
+    entries = load_user_examples(path)
+    by_hash = {e.get("sha256"): e for e in entries if e.get("source") == LOCAL_SOURCE and e.get("sha256")}
+    used = {e["index"] for e in entries} | {i for i in (example_index_of(p) for p in example_files(path)) if i}
+    next_index = max([USER_BASE - 1] + [i for i in used if i >= USER_BASE]) + 1
+
+    for img in images:
+        name = os.path.basename(str(img.get("file_name") or "")) or None
+        row = {"file_name": name}
+        data = img.get("data") or b""
+        if len(data) > LOCAL_MAX_BYTES:
+            r["failed"] += 1
+            r["images"].append({**row, "status": "failed", "error": f"larger than {LOCAL_MAX_BYTES // 2**20} MB"})
+            continue
+        try:
+            got = read_image_info(data)
+        except ValueError as e:
+            r["failed"] += 1
+            r["images"].append({**row, "status": "failed", "error": str(e)})
+            continue
+        if not got["format"]:
+            r["failed"] += 1
+            r["images"].append({**row, "status": "failed", "error": "only PNG, JPEG, WebP or GIF"})
+            continue
+        sha = hashlib.sha256(data).hexdigest()
+        entry = by_hash.get(sha)
+        meta = effective_meta(got["meta"], img)
+        on_disk = entry is not None and any(example_index_of(p) == entry["index"] for p in example_files(path))
+        if entry is not None and on_disk and not overwrite:
+            r["existed"] += 1
+            r["images"].append({**row, "index": entry["index"], "status": "existed"})
+            continue
+        is_new = entry is None
+        if is_new:
+            if next_index > USER_MAX:
+                r["status"] = "full"
+                break
+            entry = {"index": next_index, "source": LOCAL_SOURCE, "sha256": sha,
+                     "added_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        entry.update({
+            "file_name": name or entry.get("file_name"), "width": got["width"], "height": got["height"],
+            "nsfw": bool(img.get("nsfw")), "meta": meta, "infotext": got["infotext"][:8000],
+        })
+        if not on_disk or overwrite:
+            for p in example_files(path):
+                if example_index_of(p) == entry["index"]:
+                    os.remove(p)
+            target = f"{os.path.splitext(path)[0]}{EXAMPLE_TAG}{entry['index']:02d}.{got['format']}"
+            tmp = target + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, target)
+        if is_new:
+            next_index += 1
+            r["added"] += 1
+            status = "added"
+        else:
+            r["existed"] += 1
+            status = "updated" if overwrite else "restored"
+        by_hash[sha] = entry
+        r["images"].append({**row, "index": entry["index"], "status": status,
+                            "has_prompt": bool(meta.get("prompt")), "loras": used_loras(meta)})
+    keep = [e for e in entries if not (e.get("source") == LOCAL_SOURCE and e.get("sha256") in by_hash)]
+    _save_user_examples(path, keep + list(by_hash.values()))
+    if r["failed"] and not (r["added"] or r["existed"]) and r["status"] == "ok":
+        r["status"] = "failed"
+    r["total_local_examples"] = len(by_hash)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# the model's name inside saved prompts (after a rename) / moving added examples
+# ---------------------------------------------------------------------------
+
+_NAME_TAGS = {"lora": ("lora", "lyco"), "hyper": ("hypernet",)}
+_CARD_TEXT_FIELDS = ("description", "notes", "activation text")
+
+
+def rename_in_prompt(text: str, old: str, new: str, model_type: str = "lora") -> str:
+    """'<lora:old:0.8>' -> '<lora:new:0.8>' (also <lyco:…>; <hypernet:…> for hypernetworks)."""
+    tags = _NAME_TAGS.get(model_type)
+    if not tags or not text or old == new:
+        return text
+    pattern = re.compile(r"<(%s):%s(?=[:>])" % ("|".join(tags), re.escape(old)), re.IGNORECASE)
+    return pattern.sub(lambda m: f"<{m.group(1)}:{new}", text)
+
+
+def rename_in_texts(path: str, old: str, new: str, model_type: str = "lora") -> int:
+    """After renaming a model: its own name in the prompts of its added examples (sidecar) and in
+    the card file's description / notes / activation text. Returns how many texts changed. The
+    image files keep their embedded generation info as it was."""
+    changed = 0
+    entries = load_user_examples(path)
+    for e in entries:
+        meta = e.get("meta") or {}
+        fixed = rename_in_prompt(meta.get("prompt") or "", old, new, model_type)
+        if fixed != (meta.get("prompt") or ""):
+            meta["prompt"] = fixed
+            if model_type == "lora":
+                meta.pop("resources", None)
+                loras = [{"type": "lora", "name": m.group(1).strip(), "weight": _num(m.group(2)) if m.group(2) else 1}
+                         for m in _LORA_IN_PROMPT_RE.finditer(fixed)]
+                if loras:
+                    meta["resources"] = loras
+            e["meta"] = meta
+            changed += 1
+    if changed:
+        _save_user_examples(path, entries)
+    card = os.path.splitext(path)[0] + ".json"
+    if os.path.isfile(card):
+        try:
+            with open(card, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            touched = False
+            for key in _CARD_TEXT_FIELDS:
+                if isinstance(data.get(key), str):
+                    fixed = rename_in_prompt(data[key], old, new, model_type)
+                    if fixed != data[key]:
+                        data[key] = fixed
+                        touched = True
+                        changed += 1
+            if touched:
+                with open(card, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data, indent=4, ensure_ascii=False))
+    return changed
+
+
+def move_added_examples(src: str, dst: str, model_type: str = "lora") -> int:
+    """Copy the added examples (#101+) of the model at `src` to the model at `dst`, numbered after
+    dst's own; images dst already has (same local file / same civitai image) are skipped. Prompts
+    that named src now name dst. The src files are left for the caller to delete."""
+    src_stem, dst_stem = os.path.splitext(os.path.basename(src))[0], os.path.splitext(os.path.basename(dst))[0]
+    dst_entries = load_user_examples(dst)
+    have_ids = {e.get("id") for e in dst_entries if e.get("id") is not None}
+    have_hashes = {e.get("sha256") for e in dst_entries if e.get("sha256")}
+    used = {e["index"] for e in dst_entries} | {i for i in (example_index_of(p) for p in example_files(dst)) if i}
+    next_index = max([USER_BASE - 1] + [i for i in used if i >= USER_BASE]) + 1
+    src_files = {example_index_of(p): p for p in example_files(src)}
+    moved = 0
+    for e in load_user_examples(src):
+        if (e.get("id") is not None and e["id"] in have_ids) or (e.get("sha256") and e["sha256"] in have_hashes):
+            continue
+        f = src_files.get(e["index"])
+        if not f or next_index > USER_MAX:
+            continue
+        ext = os.path.splitext(f)[1]
+        shutil.copy2(f, f"{os.path.splitext(dst)[0]}{EXAMPLE_TAG}{next_index:02d}{ext}")
+        meta = dict(e.get("meta") or {})
+        if meta.get("prompt"):
+            meta["prompt"] = rename_in_prompt(meta["prompt"], src_stem, dst_stem, model_type)
+        dst_entries.append({**e, "index": next_index, "meta": meta})
+        next_index += 1
+        moved += 1
+    if moved:
+        _save_user_examples(dst, dst_entries)
+    return moved
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +928,8 @@ def build_notes(info: dict, path: str = None) -> str:
         v = user_image_view(entry)
         if not v["prompt"]:
             continue
-        b = [f"--- Example #{v['index']} (by {v.get('username') or '?'} on civitai) ---", "Prompt: " + v["prompt"].strip()]
+        who = "local image" if v.get("source") == LOCAL_SOURCE else f"by {v.get('username') or '?'} on civitai"
+        b = [f"--- Example #{v['index']} ({who}) ---", "Prompt: " + v["prompt"].strip()]
         if v["negative_prompt"]:
             b.append("Negative prompt: " + v["negative_prompt"].strip())
         params = _params_line(v)
